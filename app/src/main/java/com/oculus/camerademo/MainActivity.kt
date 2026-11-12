@@ -425,7 +425,9 @@ class MainActivity : ComponentActivity() {
   private fun onStopCamera() {
     isCameraRunning = false
     copyHandler.removeCallbacks(frameGrabber)
-    viewModel.stopModelCamera()
+    viewModel.stopCamera() // <-- GOED
+    detectedItemsState.value = emptyList()
+    aiStatusState.value = "AI Stopped"
   }
 
   private fun onExit() {
