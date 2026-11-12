@@ -19,6 +19,9 @@ jobs:
       - name: Android SDK instellen
         uses: android-actions/setup-android@v3
 
+      - name: Android SDK licenties accepteren
+        run: yes | sdkmanager --licenses > /dev/null 2>&1
+
       - name: Gradle rechten geven
         run: chmod +x gradlew
 
