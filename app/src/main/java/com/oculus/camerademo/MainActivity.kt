@@ -7,7 +7,9 @@ import android.graphics.Bitmap
 import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.os.Bundle
-import android.os.SystemClock
+import android.os.Handler
+import android.os.Looper
+import android.view.PixelCopy
 import android.view.Surface
 import android.view.TextureView
 import android.view.TextureView.SurfaceTextureListener
@@ -51,10 +53,6 @@ data class DetectedItem(
 )
 
 class MainActivity : ComponentActivity() {
-  companion object {
-    private const val FLAG_ENABLED = "enabled"
-  }
-
   private val viewModel by lazy {
     ViewModelProvider.AndroidViewModelFactory(application).create(XrCameraDemoViewModel::class.java)
   }
@@ -68,13 +66,25 @@ class MainActivity : ComponentActivity() {
   private val permissionManager = PermissionManager()
 
   private var previewSurface: Surface? = null
-  private var textureViewRef: TextureView? = null
   private var objectDetector: ObjectDetector? = null
   private val aiExecutor = Executors.newSingleThreadExecutor()
+  private val copyHandler = Handler(Looper.getMainLooper())
   private var isDetecting = false
-  private var lastImageWidth = 1
-  private var lastImageHeight = 1
+  private var isCameraRunning = false
+  private var lastImageWidth = 640
+  private var lastImageHeight = 480
   private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
+  private val aiStatusState = mutableStateOf("AI Ready")
+
+  private val frameGrabber =
+      object : Runnable {
+        override fun run() {
+          if (isCameraRunning) {
+            grabFrameAndDetect()
+            copyHandler.postDelayed(this, 150)
+          }
+        }
+      }
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
@@ -88,6 +98,7 @@ class MainActivity : ComponentActivity() {
                 modifier = Modifier.fillMaxSize().padding(innerPadding),
                 cameraState = uiState,
                 detectedItems = detectedItemsState.value,
+                aiStatus = aiStatusState.value,
                 onStartCamera = { onStartCamera() },
                 onStopCamera = { onStopCamera() },
                 onExit = { onExit() },
@@ -112,19 +123,47 @@ class MainActivity : ComponentActivity() {
           ObjectDetector.ObjectDetectorOptions.builder()
               .setBaseOptions(baseOptions)
               .setRunningMode(RunningMode.IMAGE)
-              .setMaxResults(5)
-              .setScoreThreshold(0.45f)
+              .setMaxResults(6)
+              .setScoreThreshold(0.35f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
+      aiStatusState.value = "AI Model Loaded"
     } catch (e: Exception) {
-      Toast.makeText(this, "AI Model load error: ${e.message}", Toast.LENGTH_LONG).show()
+      aiStatusState.value = "AI Error: ${e.message}"
+    }
+  }
+
+  private fun grabFrameAndDetect() {
+    val surface = previewSurface ?: return
+    if (!surface.isValid || isDetecting || objectDetector == null) return
+
+    isDetecting = true
+    val bitmap = Bitmap.createBitmap(640, 480, Bitmap.Config.ARGB_8888)
+    try {
+      PixelCopy.request(
+          surface,
+          bitmap,
+          { copyResult ->
+            if (copyResult == PixelCopy.SUCCESS) {
+              runAiDetection(bitmap)
+            } else {
+              bitmap.recycle()
+              isDetecting = false
+            }
+          },
+          copyHandler,
+      )
+    } catch (_: Exception) {
+      bitmap.recycle()
+      isDetecting = false
     }
   }
 
   private fun runAiDetection(bitmap: Bitmap) {
-    val detector = objectDetector ?: return
-    if (isDetecting) return
-    isDetecting = true
+    val detector = objectDetector ?: run {
+      isDetecting = false
+      return
+    }
     lastImageWidth = bitmap.width
     lastImageHeight = bitmap.height
 
@@ -141,9 +180,16 @@ class MainActivity : ComponentActivity() {
                   box = detection.boundingBox(),
               )
             }
-        runOnUiThread { detectedItemsState.value = items }
-      } catch (_: Exception) {
+        runOnUiThread {
+          detectedItemsState.value = items
+          aiStatusState.value =
+              if (items.isEmpty()) "AI Scanning (0 objects)"
+              else items.joinToString(", ") { "${it.label} ${(it.score * 100).toInt()}%" }
+        }
+      } catch (e: Exception) {
+        runOnUiThread { aiStatusState.value = "Detect err: ${e.message}" }
       } finally {
+        bitmap.recycle()
         isDetecting = false
       }
     }
@@ -172,11 +218,15 @@ class MainActivity : ComponentActivity() {
 
   override fun onPause() {
     super.onPause()
+    isCameraRunning = false
+    copyHandler.removeCallbacks(frameGrabber)
     viewModel.onPause()
   }
 
   override fun onStop() {
     super.onStop()
+    isCameraRunning = false
+    copyHandler.removeCallbacks(frameGrabber)
     viewModel.shutdown()
   }
 
@@ -194,14 +244,22 @@ class MainActivity : ComponentActivity() {
       return
     }
     viewModel.startCamera(surface)
+    isCameraRunning = true
+    copyHandler.removeCallbacks(frameGrabber)
+    copyHandler.postDelayed(frameGrabber, 500)
   }
 
   private fun onStopCamera() {
+    isCameraRunning = false
+    copyHandler.removeCallbacks(frameGrabber)
     viewModel.stopCamera()
     detectedItemsState.value = emptyList()
+    aiStatusState.value = "AI Stopped"
   }
 
   private fun onExit() {
+    isCameraRunning = false
+    copyHandler.removeCallbacks(frameGrabber)
     viewModel.shutdown()
     finish()
   }
@@ -228,6 +286,7 @@ class MainActivity : ComponentActivity() {
       modifier: Modifier = Modifier,
       cameraState: CameraUiState,
       detectedItems: List<DetectedItem>,
+      aiStatus: String,
       onStartCamera: () -> Unit,
       onStopCamera: () -> Unit,
       onExit: () -> Unit,
@@ -245,11 +304,8 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-          Text("AI Detected")
-          Text(
-              if (detectedItems.isEmpty()) "Scanning..."
-              else detectedItems.joinToString(", ") { "${it.label} (${(it.score * 100).toInt()}%)" }
-          )
+          Text("AI Status")
+          Text(aiStatus)
         }
       }
       Row(horizontalArrangement = Arrangement.SpaceEvenly) {
@@ -265,7 +321,6 @@ class MainActivity : ComponentActivity() {
             modifier = Modifier.fillMaxSize(),
             factory = {
               TextureView(this@MainActivity).apply {
-                textureViewRef = this
                 surfaceTextureListener =
                     object : SurfaceTextureListener {
                       override fun onSurfaceTextureAvailable(
@@ -288,16 +343,13 @@ class MainActivity : ComponentActivity() {
                         return true
                       }
 
-                      override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
-                        val bmp = textureViewRef?.bitmap ?: return
-                        runAiDetection(bmp)
-                      }
+                      override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
                     }
               }
             },
         )
 
-                Canvas(modifier = Modifier.fillMaxSize()) {
+        Canvas(modifier = Modifier.fillMaxSize()) {
           val scaleX = size.width / lastImageWidth.toFloat().coerceAtLeast(1f)
           val scaleY = size.height / lastImageHeight.toFloat().coerceAtLeast(1f)
 
