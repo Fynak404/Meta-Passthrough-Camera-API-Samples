@@ -16,7 +16,7 @@
     <uses-feature android:name="com.oculus.feature.PASSTHROUGH" />
     <meta-data
         android:name="com.oculus.supportedDevices"
-        android:value="quest3|quest3s"/>
+        android:value="quest3|quest3s" />
 
     <application
         android:allowBackup="true"
