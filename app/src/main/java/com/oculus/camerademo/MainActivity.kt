@@ -3,8 +3,11 @@
 package com.oculus.camerademo
 
 import android.Manifest
+import android.graphics.Bitmap
+import android.graphics.RectF
 import android.graphics.SurfaceTexture
 import android.os.Bundle
+import android.os.SystemClock
 import android.view.Surface
 import android.view.TextureView
 import android.view.TextureView.SurfaceTextureListener
@@ -12,7 +15,9 @@ import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,12 +26,29 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.ViewModelProvider
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.core.RunningMode
+import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.oculus.camerademo.ui.theme.CameraDemoTheme
+import java.util.concurrent.Executors
+
+data class DetectedItem(
+    val label: String,
+    val score: Float,
+    val box: RectF,
+)
 
 class MainActivity : ComponentActivity() {
   companion object {
@@ -46,9 +68,18 @@ class MainActivity : ComponentActivity() {
   private val permissionManager = PermissionManager()
 
   private var previewSurface: Surface? = null
+  private var textureViewRef: TextureView? = null
+  private var objectDetector: ObjectDetector? = null
+  private val aiExecutor = Executors.newSingleThreadExecutor()
+  private var isDetecting = false
+  private var lastImageWidth = 1
+  private var lastImageHeight = 1
+  private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    setupObjectDetector()
+
     viewModel.uiState.observe(this) { uiState ->
       setContent {
         CameraDemoTheme {
@@ -56,6 +87,7 @@ class MainActivity : ComponentActivity() {
             CameraDemoUi(
                 modifier = Modifier.fillMaxSize().padding(innerPadding),
                 cameraState = uiState,
+                detectedItems = detectedItemsState.value,
                 onStartCamera = { onStartCamera() },
                 onStopCamera = { onStopCamera() },
                 onExit = { onExit() },
@@ -69,6 +101,50 @@ class MainActivity : ComponentActivity() {
       if (event is CameraEvent.NotificationEvent) {
         Toast.makeText(this, event.message, Toast.LENGTH_SHORT).show()
         viewModel.onHandleCameraEvent()
+      }
+    }
+  }
+
+  private fun setupObjectDetector() {
+    try {
+      val baseOptions = BaseOptions.builder().setModelAssetPath("model.tflite").build()
+      val options =
+          ObjectDetector.ObjectDetectorOptions.builder()
+              .setBaseOptions(baseOptions)
+              .setRunningMode(RunningMode.IMAGE)
+              .setMaxResults(5)
+              .setScoreThreshold(0.45f)
+              .build()
+      objectDetector = ObjectDetector.createFromOptions(this, options)
+    } catch (e: Exception) {
+      Toast.makeText(this, "AI Model load error: ${e.message}", Toast.LENGTH_LONG).show()
+    }
+  }
+
+  private fun runAiDetection(bitmap: Bitmap) {
+    val detector = objectDetector ?: return
+    if (isDetecting) return
+    isDetecting = true
+    lastImageWidth = bitmap.width
+    lastImageHeight = bitmap.height
+
+    aiExecutor.execute {
+      try {
+        val mpImage = BitmapImageBuilder(bitmap).build()
+        val result = detector.detect(mpImage)
+        val items =
+            result.detections().mapNotNull { detection ->
+              val category = detection.categories().firstOrNull() ?: return@mapNotNull null
+              DetectedItem(
+                  label = category.categoryName(),
+                  score = category.score(),
+                  box = detection.boundingBox(),
+              )
+            }
+        runOnUiThread { detectedItemsState.value = items }
+      } catch (_: Exception) {
+      } finally {
+        isDetecting = false
       }
     }
   }
@@ -104,6 +180,12 @@ class MainActivity : ComponentActivity() {
     viewModel.shutdown()
   }
 
+  override fun onDestroy() {
+    super.onDestroy()
+    objectDetector?.close()
+    aiExecutor.shutdown()
+  }
+
   private fun onStartCamera() {
     checkPermissions()
     val surface = previewSurface
@@ -116,6 +198,7 @@ class MainActivity : ComponentActivity() {
 
   private fun onStopCamera() {
     viewModel.stopCamera()
+    detectedItemsState.value = emptyList()
   }
 
   private fun onExit() {
@@ -144,6 +227,7 @@ class MainActivity : ComponentActivity() {
   fun CameraDemoUi(
       modifier: Modifier = Modifier,
       cameraState: CameraUiState,
+      detectedItems: List<DetectedItem>,
       onStartCamera: () -> Unit,
       onStopCamera: () -> Unit,
       onExit: () -> Unit,
@@ -153,10 +237,7 @@ class MainActivity : ComponentActivity() {
         verticalArrangement = Arrangement.Center,
     ) {
       Row(horizontalArrangement = Arrangement.SpaceBetween) {
-        Button(
-            onClick = onStartCamera,
-            //contentDescription = stringResource(R.string.button_description_start_camera),
-        ) {
+        Button(onClick = onStartCamera) {
           Text("Start camera")
         }
 
@@ -164,31 +245,27 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.Center,
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-          Text("Avg Brightness")
-          Text(cameraState.cameraBrightness.toString())
+          Text("AI Detected")
+          Text(
+              if (detectedItems.isEmpty()) "Scanning..."
+              else detectedItems.joinToString(", ") { "${it.label} (${(it.score * 100).toInt()}%)" }
+          )
         }
       }
       Row(horizontalArrangement = Arrangement.SpaceEvenly) {
-        Button(
-            onClick = onStopCamera,
-            //contentDescription = stringResource(R.string.button_description_stop_camera),
-        ) {
+        Button(onClick = onStopCamera) {
           Text("Stop camera")
         }
-      }
-      Row(horizontalArrangement = Arrangement.SpaceEvenly) {
-        Button(
-            onClick = onExit,
-            //contentDescription = stringResource(R.string.button_description_exit),
-        ) {
+        Button(onClick = onExit) {
           Text("Exit")
         }
       }
-      Row(horizontalArrangement = Arrangement.SpaceEvenly) {
+      Box(modifier = Modifier.fillMaxSize()) {
         AndroidView(
-            modifier = modifier,
+            modifier = Modifier.fillMaxSize(),
             factory = {
               TextureView(this@MainActivity).apply {
+                textureViewRef = this
                 surfaceTextureListener =
                     object : SurfaceTextureListener {
                       override fun onSurfaceTextureAvailable(
@@ -211,7 +288,41 @@ class MainActivity : ComponentActivity() {
                         return true
                       }
 
-                      override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+                      override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {
+                        val bmp = textureViewRef?.bitmap ?: return
+                        runAiDetection(bmp)
+                      }
+                    }
+              }
+            },
+        )
+
+        Canvas(modifier = Modifier.fillMaxSize()) {
+          val scaleX = size.width / lastImageWidth.toFloat().coerceAtLeast(1f)
+          val scaleY = size.height / lastImageHeight.toFloat().coerceAtLeast(1f)
+
+          val textPaint =
+              android.graphics.Paint().apply {
+              color = android.graphics.Color.GREEN
+              textSize = 36f
+              isFakeBoldText = true
+              }
+            for (item in detectedItems) {
+            val left = item.box.left * scaleX
+            val top = item.box.top * scaleY
+            val right = item.box.right * scaleX
+            val bottom = item.box.bottom * scaleY
+            drawRect(
+            color = Color.Green,
+            topLeft = Offset(left, top),
+            size = Size(right - left, bottom - top),
+            style = Stroke(width = 4.dp.toPx()),
+           )
+            drawContext.canvas.nativeCanvas.drawText(
+            "${item.label} ${(item.score * 100).toInt()}%",
+            left,
+            (top - 8f).coerceAtLeast(36f),
+            textPaint,
                     }
               }
             },
