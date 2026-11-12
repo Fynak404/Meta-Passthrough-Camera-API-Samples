@@ -19,7 +19,7 @@ jobs:
       - name: AI Model downloaden
         run: |
           mkdir -p app/src/main/assets
-          curl -fL "https://googleapis.com" -o app/src/main/assets/model.tflite
+          curl -fL "https://storage.googleapis.com/mediapipe-models/object_detector/efficientdet_lite0/float32/1/efficientdet_lite0.tflite" -o app/src/main/assets/model.tflite
           ls -lh app/src/main/assets/model.tflite
 
 
