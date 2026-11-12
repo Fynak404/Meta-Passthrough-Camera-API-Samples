@@ -19,14 +19,20 @@ jobs:
       - name: Android SDK instellen
         uses: android-actions/setup-android@v3
 
-      - name: Android SDK licenties accepteren
-        run: yes | sdkmanager --licenses > /dev/null 2>&1
-
-      - name: Gradle rechten geven
-        run: chmod +x gradlew
+      - name: Android licenties forceren
+        run: |
+          mkdir -p "$ANDROID_HOME/licenses"
+          echo -e "\n24333f8a63b6825ea9c5514f83c2829b004d1fee" > "$ANDROID_HOME/licenses/android-sdk-license"
+          echo -e "\n84831b9409646a918e30573bab4c9c91346d8abd" > "$ANDROID_HOME/licenses/android-sdk-preview-license"
+          echo -e "\nd975f751698a77b662f1254ddbeed3901e976f5a" > "$ANDROID_HOME/licenses/intel-android-extra-license"
+          echo -e "\n33b6a2b64607f11b759f320ef9dff4ae5c47d97a" > "$ANDROID_HOME/licenses/google-gdk-license"
 
       - name: APK bouwen
-        run: ./gradlew assembleDebug
+        run: |
+          GRADLE_FILE=$(find . -name "gradlew" | head -n 1)
+          chmod +x "$GRADLE_FILE"
+          cd "$(dirname "$GRADLE_FILE")"
+          ./gradlew assembleDebug
 
       - name: APK klaarzetten om te downloaden
         uses: actions/upload-artifact@v4
