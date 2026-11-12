@@ -2,42 +2,23 @@
 
 package com.oculus.camerademo
 
-import android.Manifest
 import android.graphics.Bitmap
+import android.graphics.Color as AndroidColor
 import android.graphics.RectF
-import android.graphics.SurfaceTexture
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.PixelCopy
 import android.view.Surface
-import android.view.TextureView
-import android.view.TextureView.SurfaceTextureListener
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Text
-import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.unit.dp
-import androidx.compose.ui.viewinterop.AndroidView
 import androidx.lifecycle.ViewModelProvider
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -48,6 +29,7 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.Executors
+import kotlin.math.abs
 
 data class DetectedItem(
     val label: String,
@@ -81,13 +63,12 @@ class MainActivity : ComponentActivity() {
   private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
   private val aiStatusState = mutableStateOf("Robot Vision Ready")
 
-  // --- ROBOT VISION & ESP32 SETTINGS ---
+  // --- ESP32 & CAMERA KALIBRATIE ---
   private var udpSocket: DatagramSocket? = null
-  private val espIpAddress = "192.168.4.1" // Default ESP32 Hotspot IP
+  private val espIpAddress = "192.168.4.1"
   private val espPort = 4210
-  private val cameraFocalLengthPx = 540f // Calibrated for Quest 3 640x480 crop
+  private val cameraFocalLengthPx = 540f
 
-  // Real-world average heights in cm for COCO objects
   private val realObjectHeightsCm = mapOf(
       "person" to 170f,
       "chair" to 85f,
@@ -104,15 +85,16 @@ class MainActivity : ComponentActivity() {
       "potted plant" to 40f
   )
 
-  private var lastLockedLabel = ""
-  private var consecutiveFrameCount = 0
+  // Smoothing voor stabiele cm-meting en draairichting
+  private val distanceHistory = ArrayDeque<Int>()
+  private var lockedTurnDirection = "NONE"
 
   private val frameGrabber =
       object : Runnable {
         override fun run() {
           if (isCameraRunning) {
             grabFrameAndDetect()
-            copyHandler.postDelayed(this, 150)
+            copyHandler.postDelayed(this, 120)
           }
         }
       }
@@ -157,11 +139,11 @@ class MainActivity : ComponentActivity() {
           ObjectDetector.ObjectDetectorOptions.builder()
               .setBaseOptions(baseOptions)
               .setRunningMode(RunningMode.IMAGE)
-              .setMaxResults(5)
-              .setScoreThreshold(0.55f)
+              .setMaxResults(8)
+              .setScoreThreshold(0.50f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "Robot Vision Loaded"
+      aiStatusState.value = "Vision & 5-Point Nav Loaded"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
@@ -193,10 +175,46 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun estimateDistanceCm(label: String, box: RectF): Int {
-    val boxHeightPx = box.height().coerceAtLeast(1f)
-    val realHeight = realObjectHeightsCm[label] ?: 50f
-    return ((realHeight * cameraFocalLengthPx) / boxHeightPx).toInt()
+  private fun estimateRealisticDistanceCm(label: String, box: RectF): Int {
+    val boxHeightPx = box.height()
+    if (boxHeightPx < 18f) return 350
+
+    val realHeight = realObjectHeightsCm[label] ?: 55f
+    val rawCm = ((realHeight * cameraFocalLengthPx) / boxHeightPx).toInt()
+    return rawCm.coerceIn(15, 350)
+  }
+
+  private fun isFloorClearAndUniform(bitmap: Bitmap): Boolean {
+    val w = bitmap.width
+    val h = bitmap.height
+    val startX = (w * 0.30f).toInt()
+    val endX = (w * 0.70f).toInt()
+    val startY = (h * 0.82f).toInt()
+    val endY = (h * 0.96f).toInt()
+
+    var edgeCount = 0
+    var sampleCount = 0
+
+    for (y in startY until endY step 4) {
+      for (x in startX until endX step 4) {
+        val c1 = bitmap.getPixel(x, y)
+        val c2 = bitmap.getPixel(x + 4, y)
+        val c3 = bitmap.getPixel(x, y + 4)
+
+        val luma1 = (AndroidColor.red(c1) + AndroidColor.green(c1) + AndroidColor.blue(c1)) / 3
+        val luma2 = (AndroidColor.red(c2) + AndroidColor.green(c2) + AndroidColor.blue(c2)) / 3
+        val luma3 = (AndroidColor.red(c3) + AndroidColor.green(c3) + AndroidColor.blue(c3)) / 3
+
+        if (abs(luma1 - luma2) > 38 || abs(luma1 - luma3) > 38) {
+          edgeCount++
+        }
+        sampleCount++
+      }
+    }
+
+    if (sampleCount == 0) return true
+    val edgeRatio = edgeCount.toFloat() / sampleCount.toFloat()
+    return edgeRatio < 0.14f
   }
 
   private fun sendUdpToEsp32(payload: String) {
@@ -207,9 +225,7 @@ class MainActivity : ComponentActivity() {
         val address = InetAddress.getByName(espIpAddress)
         val packet = DatagramPacket(bytes, bytes.size, address, espPort)
         socket.send(packet)
-      } catch (_: Exception) {
-        // Silently ignore when ESP32 is not connected yet
-      }
+      } catch (_: Exception) {}
     }
   }
 
@@ -225,6 +241,7 @@ class MainActivity : ComponentActivity() {
       try {
         val mpImage = BitmapImageBuilder(bitmap).build()
         val result = detector.detect(mpImage)
+
         val items =
             result.detections().mapNotNull { detection ->
               val category = detection.categories().firstOrNull() ?: return@mapNotNull null
@@ -234,47 +251,75 @@ class MainActivity : ComponentActivity() {
                   label = name,
                   score = category.score(),
                   box = box,
-                  distanceCm = estimateDistanceCm(name, box),
+                  distanceCm = estimateRealisticDistanceCm(name, box),
               )
             }
 
-        val primaryTarget = items.minByOrNull { it.distanceCm }
+        val w = lastImageWidth.toFloat()
+        val h = lastImageHeight.toFloat()
 
-        if (primaryTarget != null) {
-          if (primaryTarget.label == lastLockedLabel) {
-            consecutiveFrameCount++
-          } else {
-            lastLockedLabel = primaryTarget.label
-            consecutiveFrameCount = 1
+        val ptTopMid = Pair(w * 0.50f, h * 0.25f)
+        val ptMid = Pair(w * 0.50f, h * 0.52f)
+        val ptBotMid = Pair(w * 0.50f, h * 0.78f)
+        val ptLeft = Pair(w * 0.20f, h * 0.55f)
+        val ptRight = Pair(w * 0.80f, h * 0.55f)
+
+        fun isPointBlocked(px: Float, py: Float): Boolean {
+          return items.any { item ->
+            item.distanceCm < 95 &&
+                px >= (item.box.left - 25f) &&
+                px <= (item.box.right + 25f) &&
+                py >= (item.box.top - 25f) &&
+                py <= (item.box.bottom + 25f)
           }
+        }
 
-          val centerX = primaryTarget.box.centerX()
-          val screenCenter = lastImageWidth / 2f
-          val offsetPercent = (((centerX - screenCenter) / screenCenter) * 100).toInt()
+        val floorOk = isFloorClearAndUniform(bitmap)
+        val topMidFree = !isPointBlocked(ptTopMid.first, ptTopMid.second)
+        val midFree = !isPointBlocked(ptMid.first, ptMid.second)
+        val botMidFree = !isPointBlocked(ptBotMid.first, ptBotMid.second) && floorOk
+        val leftFree = !isPointBlocked(ptLeft.first, ptLeft.second)
+        val rightFree = !isPointBlocked(ptRight.first, ptRight.second)
 
-          val action = when {
-            primaryTarget.distanceCm < 50 -> "STOP"
-            offsetPercent < -20 -> "LEFT"
-            offsetPercent > 20 -> "RIGHT"
-            else -> "FORWARD"
-          }
+        val centerPathClear = topMidFree && midFree && botMidFree
+        val command: String
 
-          if (consecutiveFrameCount >= 2) {
-            sendUdpToEsp32("${primaryTarget.label},${primaryTarget.distanceCm},$action,$offsetPercent")
-          }
-
-          runOnUiThread {
-            detectedItemsState.value = items
-            aiStatusState.value =
-                "ROBOT: ${primaryTarget.label} | ${primaryTarget.distanceCm}cm | $action ($offsetPercent%)"
-          }
+        if (centerPathClear) {
+          lockedTurnDirection = "NONE"
+          command = "FORWARD"
         } else {
-          consecutiveFrameCount = 0
-          sendUdpToEsp32("none,999,CLEAR,0")
-          runOnUiThread {
-            detectedItemsState.value = emptyList()
-            aiStatusState.value = "ROBOT: Clear Path (Scanning...)"
+          if (lockedTurnDirection == "NONE") {
+            lockedTurnDirection = when {
+              leftFree && !rightFree -> "TURN_LEFT"
+              rightFree && !leftFree -> "TURN_RIGHT"
+              leftFree && rightFree -> "TURN_LEFT"
+              else -> "SPIN_SEARCH"
+            }
           }
+          command = lockedTurnDirection
+        }
+
+        val closest = items.minByOrNull { it.distanceCm }
+        val smoothedCm = if (closest != null) {
+          distanceHistory.addLast(closest.distanceCm)
+          if (distanceHistory.size > 4) distanceHistory.removeFirst()
+          distanceHistory.sorted()[distanceHistory.size / 2]
+        } else {
+          distanceHistory.clear()
+          350
+        }
+
+        val whatIsIt = closest?.label ?: (if (!floorOk) "floor_obstacle" else "clear")
+
+        val pBits = "${if (topMidFree) 1 else 0}${if (midFree) 1 else 0}${if (botMidFree) 1 else 0}${if (leftFree) 1 else 0}${if (rightFree) 1 else 0}"
+        sendUdpToEsp32("CMD:$command|OBJ:$whatIsIt|CM:$smoothedCm|PTS:$pBits")
+
+        val hudPoints = "T:${if (topMidFree) "O" else "X"} M:${if (midFree) "O" else "X"} B:${if (botMidFree) "O" else "X"} | L:${if (leftFree) "O" else "X"} R:${if (rightFree) "O" else "X"}"
+        val objectText = if (closest != null) "${closest.label} (~${smoothedCm}cm)" else (if (!floorOk) "VLOER OBSTAKEL!" else "Vrij")
+
+        runOnUiThread {
+          detectedItemsState.value = items
+          aiStatusState.value = "[$command] | $hudPoints | Ziet: $objectText"
         }
       } catch (e: Exception) {
         runOnUiThread { aiStatusState.value = "Detect err: ${e.message}" }
@@ -295,14 +340,12 @@ class MainActivity : ComponentActivity() {
       if (!permissionState.vendorCameraPermissionGranted) {
         permissionsToRequest.add(PermissionManager.HZOS_CAMERA_PERMISSION)
       }
-
       if (permissionsToRequest.isNotEmpty()) {
         requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
       } else {
         viewModel.init()
       }
     }
-
     previewSurface?.let { viewModel.onResume(it) }
   }
 
@@ -329,7 +372,11 @@ class MainActivity : ComponentActivity() {
   }
 
   private fun onStartCamera() {
-    checkPermissions()
+    val permissionManager = PermissionManager()
+    if (!permissionManager.checkPermissions(this, android.Manifest.permission.CAMERA, PermissionManager.HZOS_CAMERA_PERMISSION)) {
+      Toast.makeText(this, "Missing required permissions", Toast.LENGTH_SHORT).show()
+      return
+    }
     val surface = previewSurface
     if (surface == null) {
       Toast.makeText(this, "Something went wrong - surface is not ready", Toast.LENGTH_SHORT).show()
@@ -354,123 +401,5 @@ class MainActivity : ComponentActivity() {
     copyHandler.removeCallbacks(frameGrabber)
     viewModel.shutdown()
     finish()
-  }
-
-  private fun checkPermissions() {
-    if (
-        !permissionManager.checkPermissions(
-            this,
-            Manifest.permission.CAMERA,
-            PermissionManager.HZOS_CAMERA_PERMISSION,
-        )
-    ) {
-      Toast.makeText(this, "Missing required permissions", Toast.LENGTH_SHORT).show()
-      return
-    }
-  }
-
-  private fun updatePreviewTexture(previewSurfaceTexture: SurfaceTexture, width: Int, height: Int) {
-    previewSurface = Surface(previewSurfaceTexture)
-  }
-
-  @Composable
-  fun CameraDemoUi(
-      modifier: Modifier = Modifier,
-      cameraState: CameraUiState,
-      detectedItems: List<DetectedItem>,
-      aiStatus: String,
-      onStartCamera: () -> Unit,
-      onStopCamera: () -> Unit,
-      onExit: () -> Unit,
-  ) {
-    Column(
-        modifier = modifier,
-        verticalArrangement = Arrangement.Center,
-    ) {
-      Row(horizontalArrangement = Arrangement.SpaceBetween) {
-        Button(onClick = onStartCamera) {
-          Text("Start camera")
-        }
-
-        Column(
-            verticalArrangement = Arrangement.Center,
-            horizontalAlignment = Alignment.CenterHorizontally,
-        ) {
-          Text("AI Status")
-          Text(aiStatus)
-        }
-      }
-      Row(horizontalArrangement = Arrangement.SpaceEvenly) {
-        Button(onClick = onStopCamera) {
-          Text("Stop camera")
-        }
-        Button(onClick = onExit) {
-          Text("Exit")
-        }
-      }
-      Box(modifier = Modifier.fillMaxSize()) {
-        AndroidView(
-            modifier = Modifier.fillMaxSize(),
-            factory = {
-              TextureView(this@MainActivity).apply {
-                surfaceTextureListener =
-                    object : SurfaceTextureListener {
-                      override fun onSurfaceTextureAvailable(
-                          surface: SurfaceTexture,
-                          width: Int,
-                          height: Int,
-                      ) {
-                        updatePreviewTexture(surface, width, height)
-                      }
-
-                      override fun onSurfaceTextureSizeChanged(
-                          surface: SurfaceTexture,
-                          width: Int,
-                          height: Int,
-                      ) {
-                        updatePreviewTexture(surface, width, height)
-                      }
-
-                      override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
-                        return true
-                      }
-
-                      override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
-                    }
-              }
-            },
-        )
-
-        Canvas(modifier = Modifier.fillMaxSize()) {
-          val scaleX = size.width / lastImageWidth.toFloat().coerceAtLeast(1f)
-          val scaleY = size.height / lastImageHeight.toFloat().coerceAtLeast(1f)
-
-          val textPaint =
-              android.graphics.Paint().apply {
-                color = android.graphics.Color.GREEN
-                textSize = 36f
-                isFakeBoldText = true
-              }
-
-          for (item in detectedItems) {
-            val left = item.box.left * scaleX
-            val top = item.box.top * scaleY
-            val right = item.box.right * scaleX
-            val bottom = item.box.bottom * scaleY
-
-            drawRect(
-                color = Color.Green,
-                topLeft = Offset(left, top),
-                size = Size(right - left, bottom - top),
-                style = Stroke(width = 4.dp.toPx()),
-            )
-
-            val labelText = "${item.label} (${item.distanceCm}cm) ${(item.score * 100).toInt()}%"
-            val textY = (top - 8f).coerceAtLeast(36f)
-            drawContext.canvas.nativeCanvas.drawText(labelText, left, textY, textPaint)
-          }
-        }
-      }
-    }
   }
 }
