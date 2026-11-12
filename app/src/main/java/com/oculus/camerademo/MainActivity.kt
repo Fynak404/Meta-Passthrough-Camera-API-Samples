@@ -64,25 +64,15 @@ data class DetectedItem(
     val score: Float,
     val box: RectF,
     val distanceCm: Int = 0,
+    val heightZone: String = "TORSO",
 )
 
-data class SensorPoint(
-    val tag: String,
-    val xRatio: Float,
-    val yRatio: Float,
-    val distanceCm: Int,
-    val isFree: Boolean,
-)
-
-data class NavPointsStatus(
-    val topMid: SensorPoint = SensorPoint("T", 0.50f, 0.25f, 200, true),
-    val mid: SensorPoint = SensorPoint("M", 0.50f, 0.50f, 200, true),
-    val botMid: SensorPoint = SensorPoint("B", 0.50f, 0.74f, 200, true),
-    val left: SensorPoint = SensorPoint("L", 0.20f, 0.52f, 200, true),
-    val right: SensorPoint = SensorPoint("R", 0.80f, 0.52f, 200, true),
-    val floorOk: Boolean = true,
-    val floorReason: String = "CLEAN",
-    val isStereoActive: Boolean = false,
+// 3D VOXEL CEL (X = Links/Rechts, Y = Hoogte 0..200cm, Z = Diepte vooruit)
+data class Voxel3D(
+    val x: Int,
+    val y: Int,
+    val z: Int,
+    var density: Float = 0f, // 0.0 = Lege lucht, 1.0 = Massief 3D obstakel
 )
 
 class MainActivity : ComponentActivity() {
@@ -108,14 +98,22 @@ class MainActivity : ComponentActivity() {
   private var lastImageWidth = 640
   private var lastImageHeight = 480
   private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
-  private val aiStatusState = mutableStateOf("Robot Vision Ready")
-  private val navPointsState = mutableStateOf(NavPointsStatus())
+  private val aiStatusState = mutableStateOf("3D Voxel Engine Ready")
 
-  // --- ESP32 & NAVIGATION THRESHOLDS ---
+  // --- ESP32 & 3D VOXEL MAP SETTINGS ---
   private var udpSocket: DatagramSocket? = null
   private val espIpAddress = "192.168.4.1"
   private val espPort = 4210
-  private val safeThresholdCm = 60 // Rood onder 60cm
+
+  // 3D Voxel Ruimte: 15 breed (X) x 10 hoog (Y: 0cm tot 200cm) x 15 diep (Z: 0cm tot 150cm)
+  private val sizeX = 15
+  private val sizeY = 10 // Elke laag = 20 cm hoogte (Laag 0 = Vloer/Wielen, Laag 8-9 = Quest 3 Hoofd op 180cm)
+  private val sizeZ = 15
+  private val voxelSpace = Array(sizeX) { x ->
+    Array(sizeY) { y ->
+      Array(sizeZ) { z -> Voxel3D(x, y, z, 0f) }
+    }
+  }
 
   private val realObjectHeightsCm = mapOf(
       "person" to 170f,
@@ -133,8 +131,6 @@ class MainActivity : ComponentActivity() {
       "potted plant" to 40f
   )
 
-  private val pointHistory = mutableMapOf<String, ArrayDeque<Int>>()
-  private val pointEma = mutableMapOf<String, Float>()
   private var lockedTurnDirection = "NONE"
 
   private val frameGrabber =
@@ -142,7 +138,7 @@ class MainActivity : ComponentActivity() {
         override fun run() {
           if (isCameraRunning) {
             grabFrameAndDetect()
-            copyHandler.postDelayed(this, 100) // Snelle 10 FPS loop
+            copyHandler.postDelayed(this, 100)
           }
         }
       }
@@ -150,7 +146,6 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
-    // FORCEER TRUE IMMERSIVE FULLSCREEN (Geen randen, geen statusbalken)
     WindowCompat.setDecorFitsSystemWindows(window, false)
     val controller = WindowInsetsControllerCompat(window, window.decorView)
     controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -164,11 +159,11 @@ class MainActivity : ComponentActivity() {
     viewModel.uiState.observe(this) { uiState ->
       setContent {
         CameraDemoTheme {
-          FullscreenRobotVisionUi(
+          Voxel3DRobotUi(
               modifier = Modifier.fillMaxSize(),
               cameraState = uiState,
               detectedItems = detectedItemsState.value,
-              navPoints = navPointsState.value,
+              voxels = voxelSpace,
               aiStatus = aiStatusState.value,
               onSurfaceReady = { surface -> previewSurface = surface },
               onSurfaceDestroyed = { previewSurface = null },
@@ -196,10 +191,10 @@ class MainActivity : ComponentActivity() {
               .setBaseOptions(baseOptions)
               .setRunningMode(RunningMode.IMAGE)
               .setMaxResults(8)
-              .setScoreThreshold(0.45f)
+              .setScoreThreshold(0.40f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "Immersive 3D Vision Loaded"
+      aiStatusState.value = "3D Voxel Spatial Mapper Ready"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
@@ -217,7 +212,7 @@ class MainActivity : ComponentActivity() {
           bitmap,
           { copyResult ->
             if (copyResult == PixelCopy.SUCCESS) {
-              runAiDetection(bitmap)
+              run3DSpatialMapping(bitmap)
             } else {
               bitmap.recycle()
               isDetecting = false
@@ -231,37 +226,17 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  // Anti-Jitter Filter: Mediaan + EMA (Voorkomt uitschieters naar 40cm of max)
-  private fun stabilizeCm(tag: String, rawCm: Int): Int {
-    val clamped = rawCm.coerceIn(20, 300)
-    val hist = pointHistory.getOrPut(tag) { ArrayDeque() }
-    hist.addLast(clamped)
-    if (hist.size > 6) hist.removeFirst()
-
-    val median = hist.sorted()[hist.size / 2].toFloat()
-    val prevEma = pointEma[tag] ?: median
-    val smoothed = (prevEma * 0.60f) + (median * 0.40f)
-    pointEma[tag] = smoothed
-    return smoothed.roundToInt()
-  }
-
-  // Robuuste 3D Stereo Match met strenge variantie- en contrastkeuring
-  private fun computeStereoPointDistanceCm(
-      stereo: StereoFramePair,
-      xRatio: Float,
-      yRatio: Float,
-  ): Int? {
+  // Meet 3D diepte op een specifiek punt via stereo-dispariteit (Linker + Rechter Quest 3 lens)
+  private fun measureStereoDepthCm(stereo: StereoFramePair, xRatio: Float, yRatio: Float): Int? {
     val w = stereo.width
     val h = stereo.height
     val rx = (w * xRatio).toInt()
     val ry = (h * yRatio).toInt()
+    val halfPatch = 6
+    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 25f).toInt().coerceIn(25, w / 3)
 
-    val halfPatch = 8
-    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 20f).toInt().coerceIn(30, w / 3)
-    val minDisp = 3
-
-    if (ry < halfPatch + 4 || ry >= h - halfPatch - 4) return null
-    if (rx < halfPatch + 4 || rx + maxDisp >= w - halfPatch - 4) return null
+    if (ry < halfPatch + 2 || ry >= h - halfPatch - 2) return null
+    if (rx < halfPatch + 2 || rx + maxDisp >= w - halfPatch - 2) return null
 
     var rSum = 0
     var count = 0
@@ -277,127 +252,119 @@ class MainActivity : ComponentActivity() {
     for (dy in -halfPatch..halfPatch step 2) {
       val row = (ry + dy) * w
       for (dx in -halfPatch..halfPatch step 2) {
-        val diff = (stereo.rightY[row + rx + dx].toInt() and 0xFF) - rMean
-        rVar += abs(diff)
+        rVar += abs((stereo.rightY[row + rx + dx].toInt() and 0xFF) - rMean)
       }
     }
-    // Als de patch te eg dan is er geen diepte te berekenen (voorkomt foute 40cm jumps)
     if (rVar / count < 4) return null
 
     var bestDisp = -1
     var bestSad = Int.MAX_VALUE
-    var secondBestSad = Int.MAX_VALUE
-
-    for (d in minDisp..maxDisp) {
+    for (d in 3..maxDisp) {
       val lx = rx + d
-      var bestRowSad = Int.MAX_VALUE
-      for (vy in -2..2 step 2) {
-        var lSum = 0
-        for (dy in -halfPatch..halfPatch step 2) {
-          val row = (ry + dy + vy) * w
-          for (dx in -halfPatch..halfPatch step 2) {
-            lSum += (stereo.leftY[row + lx + dx].toInt() and 0xFF)
-          }
+      var lSum = 0
+      for (dy in -halfPatch..halfPatch step 2) {
+        val row = (ry + dy) * w
+        for (dx in -halfPatch..halfPatch step 2) {
+          lSum += (stereo.leftY[row + lx + dx].toInt() and 0xFF)
         }
-        val lMean = lSum / count
-        var sad = 0
-        for (dy in -halfPatch..halfPatch step 2) {
-          val rRow = (ry + dy) * w
-          val lRow = (ry + dy + vy) * w
-          for (dx in -halfPatch..halfPatch step 2) {
-            val rVal = (stereo.rightY[rRow + rx + dx].toInt() and 0xFF) - rMean
-            val lVal = (stereo.leftY[lRow + lx + dx].toInt() and 0xFF) - lMean
-            sad += abs(rVal - lVal)
-          }
-        }
-        if (sad < bestRowSad) bestRowSad = sad
       }
-      if (bestRowSad < bestSad) {
-        secondBestSad = bestSad
-        bestSad = bestRowSad
+      val lMean = lSum / count
+      var sad = 0
+      for (dy in -halfPatch..halfPatch step 2) {
+        val rRow = (ry + dy) * w
+        val lRow = (ry + dy) * w
+        for (dx in -halfPatch..halfPatch step 2) {
+          val rVal = (stereo.rightY[rRow + rx + dx].toInt() and 0xFF) - rMean
+          val lVal = (stereo.leftY[lRow + lx + dx].toInt() and 0xFF) - lMean
+          sad += abs(rVal - lVal)
+        }
+      }
+      if (sad < bestSad) {
+        bestSad = sad
         bestDisp = d
-      } else if (bestRowSad < secondBestSad) {
-        secondBestSad = bestRowSad
       }
     }
-
     if (bestDisp <= 0) return null
-    if (secondBestSad < (bestSad * 1.12f).toInt()) return null // Uniqueness check
-
-    val distanceCm = ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt()
-    return distanceCm.coerceIn(20, 350)
+    return ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt().coerceIn(20, 250)
   }
 
-  private fun measurePoint(
-      tag: String,
-      xRatio: Float,
-      yRatio: Float,
-      stereo: StereoFramePair?,
-      items: List<DetectedItem>,
-  ): SensorPoint {
-    val stereoCm = if (stereo != null) computeStereoPointDistanceCm(stereo, xRatio, yRatio) else null
-    val px = lastImageWidth * xRatio
-    val py = lastImageHeight * yRatio
-    val coveringObj = items.filter { item ->
-      px >= (item.box.left - 15f) &&
-          px <= (item.box.right + 15f) &&
-          py >= (item.box.top - 15f) &&
-          py <= (item.box.bottom + 15f)
-    }.minByOrNull { item -> item.distanceCm }
-
-    val rawCm = when {
-      stereoCm != null && coveringObj != null -> minOf(stereoCm, coveringObj.distanceCm)
-      stereoCm != null -> stereoCm
-      coveringObj != null -> coveringObj.distanceCm
-      else -> pointEma[tag]?.roundToInt() ?: 180
-    }
-    val smoothCm = stabilizeCm(tag, rawCm)
-    return SensorPoint(
-        tag = tag,
-        xRatio = xRatio,
-        yRatio = yRatio,
-        distanceCm = smoothCm,
-        isFree = smoothCm > safeThresholdCm,
-    )
-  }
-
-  private fun analyzeFloorSafety(bitmap: Bitmap): Pair<Boolean, String> {
+  // Controleer vlakheid van de grond op laag Y=0
+  private fun isFloorFlat(bitmap: Bitmap): Boolean {
     val w = bitmap.width
     val h = bitmap.height
-    val startX = (w * 0.28f).toInt()
-    val endX = (w * 0.72f).toInt()
+    val startX = (w * 0.30f).toInt()
+    val endX = (w * 0.70f).toInt()
     val startY = (h * 0.82f).toInt()
     val endY = (h * 0.96f).toInt()
-    val colorBuckets = mutableMapOf<Int, Int>()
-    var totalSamples = 0
-    var lumaSum = 0L
-    val lumas = mutableListOf<Int>()
-
+    var grad = 0
+    var count = 0
     for (y in startY until endY step 4) {
       for (x in startX until endX step 4) {
-        val c = bitmap.getPixel(x, y)
-        val r = AndroidColor.red(c)
-        val g = AndroidColor.green(c)
-        val b = AndroidColor.blue(c)
-        val luma = (r + g + b) / 3
-        lumaSum += luma
-        lumas.add(luma)
-        totalSamples++
-        val bucketKey = ((r / 48) shl 8) or ((g / 48) shl 4) or (b / 48)
-        colorBuckets[bucketKey] = (colorBuckets[bucketKey] ?: 0) + 1
+        val c1 = bitmap.getPixel(x, y)
+        val c2 = bitmap.getPixel(x + 4, y)
+        val l1 = (AndroidColor.red(c1) + AndroidColor.green(c1) + AndroidColor.blue(c1)) / 3
+        val l2 = (AndroidColor.red(c2) + AndroidColor.green(c2) + AndroidColor.blue(c2)) / 3
+        grad += abs(l1 - l2)
+        count++
       }
     }
-    if (totalSamples == 0) return Pair(true, "CLEAN")
-    val avgLuma = (lumaSum / totalSamples).toInt()
-    val minClusterSize = (totalSamples * 0.08f).toInt()
-    val significantColors = colorBuckets.values.count { it >= minClusterSize }
-    val darkPixels = lumas.count { it < 45 && (avgLuma - it) > 50 }
-    val darkRatio = darkPixels.toFloat() / totalSamples.toFloat()
+    return if (count == 0) true else (grad.toFloat() / count) < 17f
+  }
 
-    return when {
-      darkRatio > 0.09f -> Pair(false, "VLOER OBSTAKEL")
-      significantColors >= 3 -> Pair(false, "VLOER CLUTTER")
-      else -> Pair(true, "CLEAN")
+  // Vul het 3D Voxel Raster met de gemeten dieptepunten + AI objecten
+  private fun update3DVoxelMap(
+      stereo: StereoFramePair?,
+      items: List<DetectedItem>,
+      floorOk: Boolean
+  ) {
+    // 1. Temporal Decay: vervaag oude voxels langzaam zodat de kaart live meebeweegt
+    for (x in 0 until sizeX) {
+      for (y in 0 until sizeY) {
+        for (z in 0 until sizeZ) {
+          voxelSpace[x][y][z].density = (voxelSpace[x][y][z].density * 0.80f).coerceAtLeast(0f)
+        }
+      }
+    }
+
+    // 2. Vloerlaag (Y=0) checken direct voor de wielen (Z=1..3)
+    if (!floorOk) {
+      for (x in 6..8) {
+        for (z in 1..3) {
+          voxelSpace[x][0][z].density = 1.0f
+        }
+      }
+    }
+
+    // 3. Stereo 3D Raster-scan over het gehele gezichtsveld (9x7 punten in 3D ruimte)
+    if (stereo != null) {
+      for (gx in 0 until 9) {
+        val xRatio = 0.15f + (gx * 0.0875f) // 0.15 tot 0.85
+        for (gy in 0 until 7) {
+          val yRatio = 0.15f + (gy * 0.10f) // 0.15 (Hoog/Hoofd) tot 0.75 (Laag/Vloer)
+          val distCm = measureStereoDepthCm(stereo, xRatio, yRatio) ?: continue
+
+          if (distCm < 140) {
+            val vx = ((xRatio * (sizeX - 1))).roundToInt().coerceIn(0, sizeX - 1)
+            // Y-inversie: bovenin beeld (yRatio laag) = hoog in 3D (Y=8..9, hoofdhoogte 180cm)
+            val vy = (((1f - yRatio) * (sizeY - 1))).roundToInt().coerceIn(0, sizeY - 1)
+            val vz = (distCm / 10).coerceIn(1, sizeZ - 1)
+
+            voxelSpace[vx][vy][vz].density = 1.0f
+          }
+        }
+      }
+    }
+
+    // 4. AI Objecten als 3D-volumes in het voxel-raster plaatsen
+    for (item in items) {
+      val vx = ((item.box.centerX() / lastImageWidth) * (sizeX - 1)).roundToInt().coerceIn(0, sizeX - 1)
+      val vz = (item.distanceCm / 10).coerceIn(1, sizeZ - 1)
+      val topY = (((1f - (item.box.top / lastImageHeight)) * (sizeY - 1))).roundToInt().coerceIn(0, sizeY - 1)
+      val botY = (((1f - (item.box.bottom / lastImageHeight)) * (sizeY - 1))).roundToInt().coerceIn(0, sizeY - 1)
+
+      for (y in minOf(topY, botY)..maxOf(topY, botY)) {
+        voxelSpace[vx][y][vz].density = 1.0f
+      }
     }
   }
 
@@ -413,7 +380,7 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun runAiDetection(bitmap: Bitmap) {
+  private fun run3DSpatialMapping(bitmap: Bitmap) {
     val detector = objectDetector ?: run {
       isDetecting = false
       return
@@ -423,7 +390,7 @@ class MainActivity : ComponentActivity() {
 
     aiExecutor.execute {
       try {
-        val stereoPair = viewModel.getLatestStereoPair()
+        val stereo = viewModel.getLatestStereoPair()
         val mpImage = BitmapImageBuilder(bitmap).build()
         val result = detector.detect(mpImage)
 
@@ -432,88 +399,77 @@ class MainActivity : ComponentActivity() {
               val category = detection.categories().firstOrNull() ?: return@mapNotNull null
               val name = category.categoryName()
               val box = detection.boundingBox()
-              val centerXRatio = (box.centerX() / lastImageWidth.toFloat()).coerceIn(0.05f, 0.95f)
-              val centerYRatio = (box.centerY() / lastImageHeight.toFloat()).coerceIn(0.05f, 0.95f)
-              val stereoObjCm = if (stereoPair != null) {
-                computeStereoPointDistanceCm(stereoPair, centerXRatio, centerYRatio)
-              } else null
-              val fallbackCm = if (box.height() >= 18f) {
-                (((realObjectHeightsCm[name] ?: 55f) * 540f) / box.height()).toInt().coerceIn(20, 300)
-              } else 300
-              DetectedItem(
-                  label = name,
-                  score = category.score(),
-                  box = box,
-                  distanceCm = stereoObjCm ?: fallbackCm,
-              )
+              val cx = (box.centerX() / lastImageWidth).coerceIn(0.05f, 0.95f)
+              val cy = (box.centerY() / lastImageHeight).coerceIn(0.05f, 0.95f)
+
+              val stereoDist = if (stereo != null) measureStereoDepthCm(stereo, cx, cy) else null
+              val fallbackDist = if (box.height() > 12f) {
+                (((realObjectHeightsCm[name] ?: 60f) * 540f) / box.height()).toInt().coerceIn(20, 250)
+              } else 250
+
+              val zone = when {
+                cy < 0.35f -> "HOOFD (180cm)"
+                cy < 0.70f -> "TORSO"
+                else -> "WIELEN/VLOER"
+              }
+              DetectedItem(name, category.score(), box, stereoDist ?: fallbackDist, zone)
             }
 
-        val floorCheck = analyzeFloorSafety(bitmap)
-        val floorOk = floorCheck.first
-        val floorReason = floorCheck.second
+        val floorOk = isFloorFlat(bitmap)
+        update3DVoxelMap(stereo, items, floorOk)
 
-        val ptT = measurePoint("T", 0.50f, 0.25f, stereoPair, items)
-        val ptM = measurePoint("M", 0.50f, 0.50f, stereoPair, items)
-        val rawBot = measurePoint("B", 0.50f, 0.74f, stereoPair, items)
-        val ptB = if (!floorOk && rawBot.distanceCm > 45) {
-          rawBot.copy(distanceCm = 35, isFree = false)
-        } else {
-          rawBot
+        // 3D KOLLISIE CHECK OVER DE HELE HOOGTE VAN DE 1.80M ROBOT (Y = 0 tot Y = 9)
+        var centerBlocked = !floorOk
+        var leftBlocked = false
+        var rightBlocked = false
+        var blockedHeightZone = "VRIJ"
+
+        for (y in 0 until sizeY) {
+          for (z in 1..6) { // Kijk tot 60 cm vooruit in 3D
+            // Middenkolom (X = 6, 7, 8)
+            if (voxelSpace[6][y][z].density > 0.6f || voxelSpace[7][y][z].density > 0.6f || voxelSpace[8][y][z].density > 0.6f) {
+              centerBlocked = true
+              blockedHeightZone = if (y >= 7) "HOOFD-HOOGTE" else if (y >= 3) "TORSO-HOOGTE" else "VLOER/WIELEN"
+            }
+            // Linkerkolom (X = 2, 3, 4)
+            if (voxelSpace[2][y][z].density > 0.6f || voxelSpace[3][y][z].density > 0.6f) {
+              leftBlocked = true
+            }
+            // Rechterkolom (X = 10, 11, 12)
+            if (voxelSpace[10][y][z].density > 0.6f || voxelSpace[11][y][z].density > 0.6f) {
+              rightBlocked = true
+            }
+          }
         }
-        val ptL = measurePoint("L", 0.20f, 0.52f, stereoPair, items)
-        val ptR = measurePoint("R", 0.80f, 0.52f, stereoPair, items)
 
-        val navStatus = NavPointsStatus(
-            topMid = ptT,
-            mid = ptM,
-            botMid = ptB,
-            left = ptL,
-            right = ptR,
-            floorOk = floorOk,
-            floorReason = floorReason,
-            isStereoActive = stereoPair != null,
-        )
-
-        val centerPathClear = ptT.isFree && ptM.isFree && ptB.isFree && floorOk
         val command: String
-        if (centerPathClear) {
+        if (!centerBlocked) {
           lockedTurnDirection = "NONE"
           command = "FORWARD"
         } else {
           if (lockedTurnDirection == "NONE") {
             lockedTurnDirection = when {
-              ptL.isFree && !ptR.isFree -> "TURN_LEFT"
-              ptR.isFree && !ptL.isFree -> "TURN_RIGHT"
-              ptL.isFree && ptR.isFree -> if (ptL.distanceCm >= ptR.distanceCm) "TURN_LEFT" else "TURN_RIGHT"
+              !leftBlocked && rightBlocked -> "TURN_LEFT"
+              !rightBlocked && leftBlocked -> "TURN_RIGHT"
+              !leftBlocked && !rightBlocked -> "TURN_LEFT"
               else -> "SPIN_SEARCH"
             }
           }
           command = lockedTurnDirection
         }
 
-        val closestObj = items.minByOrNull { item -> item.distanceCm }
-        val minCm = minOf(
-            ptT.distanceCm,
-            ptM.distanceCm,
-            ptB.distanceCm,
-            closestObj?.distanceCm ?: 300
-        )
+        val closest = items.minByOrNull { it.distanceCm }
+        val minCm = closest?.distanceCm ?: (if (!floorOk) 30 else 250)
+        val objLabel = closest?.label ?: (if (!floorOk) "uneven_floor" else "clear_3d")
 
-        val whatIsIt = closestObj?.label ?: (if (!floorOk) "floor_$floorReason" else "clear")
-        val pBits = "${if (ptT.isFree) 1 else 0}${if (ptM.isFree) 1 else 0}${if (ptB.isFree) 1 else 0}${if (ptL.isFree) 1 else 0}${if (ptR.isFree) 1 else 0}"
-        
-        sendUdpToEsp32("CMD:$command|OBJ:$whatIsIt|CM:$minCm|PTS:$pBits")
-
-        val stereoTag = if (stereoPair != null) "[3D STEREO]" else "[MONO AI]"
-        val objectText = if (closestObj != null) "${closestObj.label} (~${closestObj.distanceCm}cm)" else (if (!floorOk) "VLOER: $floorReason" else "Vrij")
+        sendUdpToEsp32("CMD:$command|OBJ:$objLabel|CM:$minCm|ZONE:$blockedHeightZone")
 
         runOnUiThread {
           detectedItemsState.value = items
-          navPointsState.value = navStatus
-          aiStatusState.value = "$stereoTag [$command] | Ziet: $objectText"
+          aiStatusState.value = "3D VOXEL [$command] | Hoogte: $blockedHeightZone | Grond: ${if (floorOk) "VLAK" else "ONVLAK"}"
         }
       } catch (e: Exception) {
-        runOnUiThread { aiStatusState.value = "Detect err: ${e.message}" }
+        runOnUiThread { aiStatusState.value = "3D Map err: ${e.message}" }
       } finally {
         bitmap.recycle()
         isDetecting = false
@@ -566,7 +522,7 @@ class MainActivity : ComponentActivity() {
     checkPermissions()
     val surface = previewSurface
     if (surface == null) {
-      Toast.makeText(this, "Surface is niet gereed", Toast.LENGTH_SHORT).show()
+      Toast.makeText(this, "Surface niet klaar", Toast.LENGTH_SHORT).show()
       return
     }
     viewModel.startCamera(surface)
@@ -580,7 +536,7 @@ class MainActivity : ComponentActivity() {
     copyHandler.removeCallbacks(frameGrabber)
     viewModel.stopCamera()
     detectedItemsState.value = emptyList()
-    aiStatusState.value = "Vision Gestopt"
+    aiStatusState.value = "3D Mapping Gestopt"
   }
 
   private fun onExit() {
@@ -596,17 +552,17 @@ class MainActivity : ComponentActivity() {
             PermissionManager.HZOS_CAMERA_PERMISSION,
         )
     ) {
-      Toast.makeText(this, "Mist benodigde permissies", Toast.LENGTH_SHORT).show()
+      Toast.makeText(this, "Mist camerabevoegdheden", Toast.LENGTH_SHORT).show()
     }
   }
 }
 
 @Composable
-fun FullscreenRobotVisionUi(
+fun Voxel3DRobotUi(
     modifier: Modifier = Modifier,
     cameraState: Any,
     detectedItems: List<DetectedItem>,
-    navPoints: NavPointsStatus,
+    voxels: Array<Array<Array<Voxel3D>>>,
     aiStatus: String,
     onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
@@ -615,7 +571,6 @@ fun FullscreenRobotVisionUi(
     onExit: () -> Unit,
 ) {
   Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
-    // 1. 100% IMMERSIVE FULLSCREEN PASSTHROUGH VIEW
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
@@ -636,63 +591,66 @@ fun FullscreenRobotVisionUi(
         },
     )
 
-    // 2. AR HUD OVERLAY (Boxen + 5 Meetpunten + Vloerzone)
+    // 3D VOXEL PROJECTION & HUD OVERLAY
     Canvas(modifier = Modifier.fillMaxSize()) {
       val scaleX = size.width / 640f
       val scaleY = size.height / 480f
       val textPaint = Paint().apply {
         color = AndroidColor.WHITE
-        textSize = 36f
+        textSize = 32f
         isAntiAlias = true
         setShadowLayer(6f, 2f, 2f, AndroidColor.BLACK)
       }
 
+      // Teken 3D AI Object Boxen + Hoogtezone
       for (item in detectedItems) {
         val left = item.box.left * scaleX
         val top = item.box.top * scaleY
         val right = item.box.right * scaleX
         val bottom = item.box.bottom * scaleY
-        val boxColor = if (item.distanceCm < 60) Color(0xFFFF3B30) else Color(0xFF00E5FF)
-
         drawRect(
-            color = boxColor,
+            color = if (item.distanceCm < 70) Color(0xFFFF3B30) else Color(0xFF00E5FF),
             topLeft = Offset(left, top),
             size = Size(right - left, bottom - top),
-            style = Stroke(width = 5f),
+            style = Stroke(width = 4f),
         )
         drawContext.canvas.nativeCanvas.drawText(
-            "${item.label} (${item.distanceCm}cm)",
-            left + 8f,
-            (top - 10f).coerceAtLeast(40f),
+            "${item.label} | ${item.distanceCm}cm [${item.heightZone}]",
+            left + 6f,
+            (top - 8f).coerceAtLeast(35f),
             textPaint,
         )
       }
 
-      val floorColor = if (navPoints.floorOk) Color(0x5500FF66) else Color(0x88FF2222)
-      drawRect(
-          color = floorColor,
-          topLeft = Offset(size.width * 0.28f, size.height * 0.82f),
-          size = Size(size.width * 0.44f, size.height * 0.14f),
-          style = Stroke(width = 4f),
-      )
-
-      fun drawNavSensor(pt: SensorPoint) {
-        val cx = size.width * pt.xRatio
-        val cy = size.height * pt.yRatio
-        val dotColor = if (pt.isFree) Color(0xFF00FF66) else Color(0xFFFF2222)
-        drawCircle(color = dotColor, radius = 22f, center = Offset(cx, cy))
-        drawCircle(color = Color.White, radius = 26f, center = Offset(cx, cy), style = Stroke(3f))
-        drawContext.canvas.nativeCanvas.drawText("${pt.tag}:${pt.distanceCm}cm", cx - 35f, cy + 52f, textPaint)
+      // Teken 3D Voxel Radar (Top-Down + Hoogte-indicatie) rechtsboven
+      val radarX = size.width - 200f
+      val radarY = 110f
+      val cell = 11f
+      for (x in 0 until 15) {
+        for (z in 0 until 15) {
+          var maxYBlocked = -1
+          for (y in 0 until 10) {
+            if (voxels[x][y][z].density > 0.6f) {
+              maxYBlocked = y
+            }
+          }
+          val color = when {
+            x == 7 && z == 0 -> Color.Blue // Robot (1.80m)
+            maxYBlocked >= 7 -> Color.Magenta // Hoofdhoogte obstakel (140-180cm)
+            maxYBlocked >= 3 -> Color.Red // Torso obstakel (60-140cm)
+            maxYBlocked >= 0 -> Color.Yellow // Laag obstakel / Vloer (0-60cm)
+            else -> Color.Green.copy(alpha = 0.25f)
+          }
+          drawRect(
+              color = color,
+              topLeft = Offset(radarX + (x * cell), radarY + ((14 - z) * cell)),
+              size = Size(cell - 1f, cell - 1f),
+          )
+        }
       }
-
-      drawNavSensor(navPoints.topMid)
-      drawNavSensor(navPoints.mid)
-      drawNavSensor(navPoints.botMid)
-      drawNavSensor(navPoints.left)
-      drawNavSensor(navPoints.right)
     }
 
-    // 3. ZWEVENDE STATUS BAR BOVENIN
+    // Top Status Banner
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
@@ -708,7 +666,7 @@ fun FullscreenRobotVisionUi(
       )
     }
 
-    // 4. BESTURINGSKNOPPEN ONDERIN
+    // Bottom Controls
     Row(
         modifier = Modifier
             .align(Alignment.BottomCenter)
@@ -720,7 +678,7 @@ fun FullscreenRobotVisionUi(
           onClick = onStartCamera,
           colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC007AFF)),
       ) {
-        Text("Start Vision")
+        Text("Start 3D Map")
       }
       Button(
           onClick = onStopCamera,
