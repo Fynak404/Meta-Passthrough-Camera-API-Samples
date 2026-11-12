@@ -57,6 +57,7 @@ import java.net.DatagramSocket
 import java.net.InetAddress
 import java.util.concurrent.Executors
 import kotlin.math.abs
+import kotlin.math.roundToInt
 
 data class DetectedItem(
     val label: String,
@@ -65,13 +66,23 @@ data class DetectedItem(
     val distanceCm: Int = 0,
 )
 
+data class SensorPoint(
+    val tag: String,
+    val xRatio: Float,
+    val yRatio: Float,
+    val distanceCm: Int,
+    val isFree: Boolean,
+)
+
 data class NavPointsStatus(
-    val topMidFree: Boolean = true,
-    val midFree: Boolean = true,
-    val botMidFree: Boolean = true,
-    val leftFree: Boolean = true,
-    val rightFree: Boolean = true,
+    val topMid: SensorPoint = SensorPoint("T", 0.50f, 0.25f, 200, true),
+    val mid: SensorPoint = SensorPoint("M", 0.50f, 0.50f, 200, true),
+    val botMid: SensorPoint = SensorPoint("B", 0.50f, 0.74f, 200, true),
+    val left: SensorPoint = SensorPoint("L", 0.20f, 0.52f, 200, true),
+    val right: SensorPoint = SensorPoint("R", 0.80f, 0.52f, 200, true),
     val floorOk: Boolean = true,
+    val floorReason: String = "CLEAN",
+    val isStereoActive: Boolean = false,
 )
 
 class MainActivity : ComponentActivity() {
@@ -100,11 +111,11 @@ class MainActivity : ComponentActivity() {
   private val aiStatusState = mutableStateOf("Robot Vision Ready")
   private val navPointsState = mutableStateOf(NavPointsStatus())
 
-  // --- ESP32 & CAMERA KALIBRATIE ---
+  // --- ESP32 & NAVIGATION THRESHOLDS ---
   private var udpSocket: DatagramSocket? = null
   private val espIpAddress = "192.168.4.1"
   private val espPort = 4210
-  private val cameraFocalLengthPx = 540f
+  private val safeThresholdCm = 55 // <= 55cm turns RED and triggers turn
 
   private val realObjectHeightsCm = mapOf(
       "person" to 170f,
@@ -122,7 +133,8 @@ class MainActivity : ComponentActivity() {
       "potted plant" to 40f
   )
 
-  private val distanceHistory = ArrayDeque<Int>()
+  private val pointHistory = mutableMapOf<String, ArrayDeque<Int>>()
+  private val pointEma = mutableMapOf<String, Float>()
   private var lockedTurnDirection = "NONE"
 
   private val frameGrabber =
@@ -130,7 +142,7 @@ class MainActivity : ComponentActivity() {
         override fun run() {
           if (isCameraRunning) {
             grabFrameAndDetect()
-            copyHandler.postDelayed(this, 120)
+            copyHandler.postDelayed(this, 110)
           }
         }
       }
@@ -138,7 +150,6 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
-    // Verberg statusbalken voor 100% edge-to-edge fullscreen
     WindowCompat.setDecorFitsSystemWindows(window, false)
     val controller = WindowInsetsControllerCompat(window, window.decorView)
     controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -187,7 +198,7 @@ class MainActivity : ComponentActivity() {
               .setScoreThreshold(0.50f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "Vision & 5-Point Nav Loaded"
+      aiStatusState.value = "3D Stereo Vision Loaded"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
@@ -219,44 +230,169 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun estimateRealisticDistanceCm(label: String, box: RectF): Int {
-    val boxHeightPx = box.height()
-    if (boxHeightPx < 18f) return 350
-    val realHeight = realObjectHeightsCm[label] ?: 55f
-    val rawCm = ((realHeight * cameraFocalLengthPx) / boxHeightPx).toInt()
-    return rawCm.coerceIn(15, 350)
+  private fun stabilizeCm(tag: String, rawCm: Int): Int {
+    val clamped = rawCm.coerceIn(15, 300)
+    val hist = pointHistory.getOrPut(tag) { ArrayDeque() }
+    hist.addLast(clamped)
+    if (hist.size > 5) hist.removeFirst()
+
+    val median = hist.sorted()[hist.size / 2].toFloat()
+    val prevEma = pointEma[tag] ?: median
+    val smoothed = (prevEma * 0.65f) + (median * 0.35f)
+    pointEma[tag] = smoothed
+    return smoothed.roundToInt()
   }
 
-  private fun isFloorClearAndUniform(bitmap: Bitmap): Boolean {
-    val w = bitmap.width
-    val h = bitmap.height
-    val startX = (w * 0.30f).toInt()
-    val endX = (w * 0.70f).toInt()
-    val startY = (h * 0.82f).toInt()
-    val endY = (h * 0.96f).toInt()
+  private fun computeStereoPointDistanceCm(
+      stereo: StereoFramePair,
+      xRatio: Float,
+      yRatio: Float,
+  ): Int? {
+    val w = stereo.width
+    val h = stereo.height
+    val rx = (w * xRatio).toInt()
+    val ry = (h * yRatio).toInt()
 
-    var edgeCount = 0
-    var sampleCount = 0
+    val halfPatch = 8
+    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 18f).toInt().coerceIn(40, w / 3)
+    val minDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 300f).toInt().coerceAtLeast(2)
 
-    for (y in startY until endY step 4) {
-      for (x in startX until endX step 4) {
-        val c1 = bitmap.getPixel(x, y)
-        val c2 = bitmap.getPixel(x + 4, y)
-        val c3 = bitmap.getPixel(x, y + 4)
+    if (ry < halfPatch + 4 || ry >= h - halfPatch - 4) return null
+    if (rx < halfPatch + 4 || rx + maxDisp >= w - halfPatch - 4) return null
 
-        val luma1 = (AndroidColor.red(c1) + AndroidColor.green(c1) + AndroidColor.blue(c1)) / 3
-        val luma2 = (AndroidColor.red(c2) + AndroidColor.green(c2) + AndroidColor.blue(c2)) / 3
-        val luma3 = (AndroidColor.red(c3) + AndroidColor.green(c3) + AndroidColor.blue(c3)) / 3
-
-        if (abs(luma1 - luma2) > 38 || abs(luma1 - luma3) > 38) {
-          edgeCount++
-        }
-        sampleCount++
+    var rSum = 0
+    var count = 0
+    for (dy in -halfPatch..halfPatch step 2) {
+      val row = (ry + dy) * w
+      for (dx in -halfPatch..halfPatch step 2) {
+        rSum += (stereo.rightY[row + rx + dx].toInt() and 0xFF)
+        count++
       }
     }
+    val rMean = rSum / count
+    var rVar = 0
+    for (dy in -halfPatch..halfPatch step 2) {
+      val row = (ry + dy) * w
+      for (dx in -halfPatch..halfPatch step 2) {
+        val diff = (stereo.rightY[row + rx + dx].toInt() and 0xFF) - rMean
+        rVar += abs(diff)
+      }
+    }
+    if (rVar / count < 3) return null
 
-    if (sampleCount == 0) return true
-    return (edgeCount.toFloat() / sampleCount.toFloat()) < 0.14f
+    var bestDisp = -1
+    var bestSad = Int.MAX_VALUE
+    var secondBestSad = Int.MAX_VALUE
+    for (d in minDisp..maxDisp) {
+      val lx = rx + d
+      var bestRowSad = Int.MAX_VALUE
+      for (vy in -2..2 step 2) {
+        var lSum = 0
+        for (dy in -halfPatch..halfPatch step 2) {
+          val row = (ry + dy + vy) * w
+          for (dx in -halfPatch..halfPatch step 2) {
+            lSum += (stereo.leftY[row + lx + dx].toInt() and 0xFF)
+          }
+        }
+        val lMean = lSum / count
+        var sad = 0
+        for (dy in -halfPatch..halfPatch step 2) {
+          val rRow = (ry + dy) * w
+          val lRow = (ry + dy + vy) * w
+          for (dx in -halfPatch..halfPatch step 2) {
+            val rVal = (stereo.rightY[rRow + rx + dx].toInt() and 0xFF) - rMean
+            val lVal = (stereo.leftY[lRow + lx + dx].toInt() and 0xFF) - lMean
+            sad += abs(rVal - lVal)
+          }
+        }
+        if (sad < bestRowSad) bestRowSad = sad
+      }
+      if (bestRowSad < bestSad) {
+        secondBestSad = bestSad
+        bestSad = bestRowSad
+        bestDisp = d
+      } else if (bestRowSad < secondBestSad) {
+        secondBestSad = bestRowSad
+      }
+    }
+    if (bestDisp <= 0) return null
+    if (secondBestSad < (bestSad * 1.08f).toInt()) return null
+    val distanceCm = ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt()
+    return distanceCm.coerceIn(15, 300)
+  }
+
+  private fun measurePoint(
+      tag: String,
+      xRatio: Float,
+      yRatio: Float,
+      stereo: StereoFramePair?,
+      items: List<DetectedItem>,
+  ): SensorPoint {
+    val stereoCm = if (stereo != null) computeStereoPointDistanceCm(stereo, xRatio, yRatio) else null
+    val px = lastImageWidth * xRatio
+    val py = lastImageHeight * yRatio
+    val coveringObj = items.filter { item ->
+      px >= (item.box.left - 12f) &&
+          px <= (item.box.right + 12f) &&
+          py >= (item.box.top - 12f) &&
+          py <= (item.box.bottom + 12f)
+    }.minByOrNull { item -> item.distanceCm }
+
+    val rawCm = when {
+      stereoCm != null && coveringObj != null -> minOf(stereoCm, coveringObj.distanceCm)
+      stereoCm != null -> stereoCm
+      coveringObj != null -> coveringObj.distanceCm
+      else -> pointEma[tag]?.roundToInt() ?: 180
+    }
+    val smoothCm = stabilizeCm(tag, rawCm)
+    return SensorPoint(
+        tag = tag,
+        xRatio = xRatio,
+        yRatio = yRatio,
+        distanceCm = smoothCm,
+        isFree = smoothCm > safeThresholdCm,
+    )
+  }
+
+  private fun analyzeFloorSafety(bitmap: Bitmap): Pair<Boolean, String> {
+    val w = bitmap.width
+    val h = bitmap.height
+    val startX = (w * 0.28f).toInt()
+    val endX = (w * 0.72f).toInt()
+    val startY = (h * 0.82f).toInt()
+    val endY = (h * 0.96f).toInt()
+    val colorBuckets = mutableMapOf<Int, Int>()
+    var totalSamples = 0
+    var lumaSum = 0L
+    val lumas = mutableListOf<Int>()
+    for (y in startY until endY step 4) {
+      for (x in startX until endX step 4) {
+        val c = bitmap.getPixel(x, y)
+        val r = AndroidColor.red(c)
+        val g = AndroidColor.green(c)
+        val b = AndroidColor.blue(c)
+        val luma = (r + g + b) / 3
+        lumaSum += luma
+        lumas.add(luma)
+        totalSamples++
+        val qR = r / 48
+        val qG = g / 48
+        val qB = b / 48
+        val bucketKey = (qR shl 8) or (qG shl 4) or qB
+        colorBuckets[bucketKey] = (colorBuckets[bucketKey] ?: 0) + 1
+      }
+    }
+    if (totalSamples == 0) return Pair(true, "CLEAN")
+    val avgLuma = (lumaSum / totalSamples).toInt()
+    val minClusterSize = (totalSamples * 0.07f).toInt()
+    val significantColors = colorBuckets.values.count { it >= minClusterSize }
+    val darkPixels = lumas.count { it < 42 && (avgLuma - it) > 45 }
+    val darkRatio = darkPixels.toFloat() / totalSamples.toFloat()
+    return when {
+      darkRatio > 0.08f -> Pair(false, "DARK OBJECT")
+      significantColors >= 3 -> Pair(false, "CLUTTER ($significantColors COLORS)")
+      else -> Pair(true, "CLEAN")
+    }
   }
 
   private fun sendUdpToEsp32(payload: String) {
@@ -281,6 +417,7 @@ class MainActivity : ComponentActivity() {
 
     aiExecutor.execute {
       try {
+        val stereoPair = viewModel.getLatestStereoPair()
         val mpImage = BitmapImageBuilder(bitmap).build()
         val result = detector.detect(mpImage)
 
@@ -289,40 +426,48 @@ class MainActivity : ComponentActivity() {
               val category = detection.categories().firstOrNull() ?: return@mapNotNull null
               val name = category.categoryName()
               val box = detection.boundingBox()
+              val centerXRatio = (box.centerX() / lastImageWidth.toFloat()).coerceIn(0.05f, 0.95f)
+              val centerYRatio = (box.centerY() / lastImageHeight.toFloat()).coerceIn(0.05f, 0.95f)
+              val stereoObjCm = if (stereoPair != null) {
+                computeStereoPointDistanceCm(stereoPair, centerXRatio, centerYRatio)
+              } else null
+              val fallbackCm = if (box.height() >= 18f) {
+                (((realObjectHeightsCm[name] ?: 55f) * 540f) / box.height()).toInt().coerceIn(15, 300)
+              } else 300
               DetectedItem(
                   label = name,
                   score = category.score(),
                   box = box,
-                  distanceCm = estimateRealisticDistanceCm(name, box),
+                  distanceCm = stereoObjCm ?: fallbackCm,
               )
             }
 
-        val w = lastImageWidth.toFloat()
-        val h = lastImageHeight.toFloat()
-        val ptTopMid = Pair(w * 0.50f, h * 0.25f)
-        val ptMid = Pair(w * 0.50f, h * 0.52f)
-        val ptBotMid = Pair(w * 0.50f, h * 0.78f)
-        val ptLeft = Pair(w * 0.20f, h * 0.55f)
-        val ptRight = Pair(w * 0.80f, h * 0.55f)
-
-        fun isPointBlocked(px: Float, py: Float): Boolean {
-          return items.any { item ->
-            item.distanceCm < 95 &&
-                px >= (item.box.left - 25f) &&
-                px <= (item.box.right + 25f) &&
-                py >= (item.box.top - 25f) &&
-                py <= (item.box.bottom + 25f)
-          }
+        val floorCheck = analyzeFloorSafety(bitmap)
+        val floorOk = floorCheck.first
+        val floorReason = floorCheck.second
+        val ptT = measurePoint("T", 0.50f, 0.25f, stereoPair, items)
+        val ptM = measurePoint("M", 0.50f, 0.50f, stereoPair, items)
+        val rawBot = measurePoint("B", 0.50f, 0.74f, stereoPair, items)
+        val ptB = if (!floorOk && rawBot.distanceCm > 40) {
+          rawBot.copy(distanceCm = 40, isFree = false)
+        } else {
+          rawBot
         }
+        val ptL = measurePoint("L", 0.20f, 0.52f, stereoPair, items)
+        val ptR = measurePoint("R", 0.80f, 0.52f, stereoPair, items)
 
-        val floorOk = isFloorClearAndUniform(bitmap)
-        val topMidFree = !isPointBlocked(ptTopMid.first, ptTopMid.second)
-        val midFree = !isPointBlocked(ptMid.first, ptMid.second)
-        val botMidFree = !isPointBlocked(ptBotMid.first, ptBotMid.second) && floorOk
-        val leftFree = !isPointBlocked(ptLeft.first, ptLeft.second)
-        val rightFree = !isPointBlocked(ptRight.first, ptRight.second)
+        val navStatus = NavPointsStatus(
+            topMid = ptT,
+            mid = ptM,
+            botMid = ptB,
+            left = ptL,
+            right = ptR,
+            floorOk = floorOk,
+            floorReason = floorReason,
+            isStereoActive = stereoPair != null,
+        )
 
-        val centerPathClear = topMidFree && midFree && botMidFree
+        val centerPathClear = ptT.isFree && ptM.isFree && ptB.isFree && floorOk
         val command: String
         if (centerPathClear) {
           lockedTurnDirection = "NONE"
@@ -330,34 +475,35 @@ class MainActivity : ComponentActivity() {
         } else {
           if (lockedTurnDirection == "NONE") {
             lockedTurnDirection = when {
-              leftFree && !rightFree -> "TURN_LEFT"
-              rightFree && !leftFree -> "TURN_RIGHT"
-              leftFree && rightFree -> "TURN_LEFT"
+              ptL.isFree && !ptR.isFree -> "TURN_LEFT"
+              ptR.isFree && !ptL.isFree -> "TURN_RIGHT"
+              ptL.isFree && ptR.isFree -> if (ptL.distanceCm >= ptR.distanceCm) "TURN_LEFT" else "TURN_RIGHT"
               else -> "SPIN_SEARCH"
             }
           }
           command = lockedTurnDirection
         }
 
-        val closest = items.minByOrNull { it.distanceCm }
-        val smoothedCm = if (closest != null) {
-          distanceHistory.addLast(closest.distanceCm)
-          if (distanceHistory.size > 4) distanceHistory.removeFirst()
-          distanceHistory.sorted()[distanceHistory.size / 2]
-        } else {
-          distanceHistory.clear()
-          350
-        }
+        val closestObj = items.minByOrNull { item -> item.distanceCm }
+        val minCm = minOf(
+            ptT.distanceCm,
+            ptM.distanceCm,
+            ptB.distanceCm,
+            closestObj?.distanceCm ?: 300
+        )
 
-        val whatIsIt = closest?.label ?: (if (!floorOk) "floor_obstacle" else "clear")
-        val pBits = "${if (topMidFree) 1 else 0}${if (midFree) 1 else 0}${if (botMidFree) 1 else 0}${if (leftFree) 1 else 0}${if (rightFree) 1 else 0}"
-        sendUdpToEsp32("CMD:$command|OBJ:$whatIsIt|CM:$smoothedCm|PTS:$pBits")
+        val whatIsIt = closestObj?.label ?: (if (!floorOk) "floor_$floorReason" else "clear")
+        val pBits = "${if (ptT.isFree) 1 else 0}${if (ptM.isFree) 1 else 0}${if (ptB.isFree) 1 else 0}${if (ptL.isFree) 1 else 0}${if (ptR.isFree) 1 else 0}"
+        
+        sendUdpToEsp32("CMD:$command|OBJ:$whatIsIt|CM:$minCm|PTS:$pBits")
 
-        val objectText = if (closest != null) "${closest.label} (~${smoothedCm}cm)" else (if (!floorOk) "VLOER OBSTAKEL!" else "Vrij")
+        val stereoTag = if (stereoPair != null) "[3D STEREO]" else "[MONO AI]"
+        val objectText = if (closestObj != null) "${closestObj.label} (~${closestObj.distanceCm}cm)" else (if (!floorOk) "VLOER: $floorReason" else "Vrij")
+
         runOnUiThread {
           detectedItemsState.value = items
-          navPointsState.value = NavPointsStatus(topMidFree, midFree, botMidFree, leftFree, rightFree, floorOk)
-          aiStatusState.value = "[$command]  |  Ziet: $objectText"
+          navPointsState.value = navStatus
+          aiStatusState.value = "$stereoTag [$command] | Ziet: $objectText"
         }
       } catch (e: Exception) {
         runOnUiThread { aiStatusState.value = "Detect err: ${e.message}" }
@@ -425,7 +571,7 @@ class MainActivity : ComponentActivity() {
   private fun onStopCamera() {
     isCameraRunning = false
     copyHandler.removeCallbacks(frameGrabber)
-    viewModel.stopCamera() // <-- GOED
+    viewModel.stopCamera()
     detectedItemsState.value = emptyList()
     aiStatusState.value = "AI Stopped"
   }
@@ -462,7 +608,6 @@ fun FullscreenRobotVisionUi(
     onExit: () -> Unit,
 ) {
   Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
-    // 1. 100% FULLSCREEN CAMERA FEED
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
@@ -483,7 +628,6 @@ fun FullscreenRobotVisionUi(
         },
     )
 
-    // 2. FULLSCREEN AR / ROBOT HUD OVERLAY (Boxen + 5 Meetpunten + Vloerzone)
     Canvas(modifier = Modifier.fillMaxSize()) {
       val scaleX = size.width / 640f
       val scaleY = size.height / 480f
@@ -494,13 +638,12 @@ fun FullscreenRobotVisionUi(
         setShadowLayer(6f, 2f, 2f, AndroidColor.BLACK)
       }
 
-      // Teken AI Object Boxen + Afstand in cm
       for (item in detectedItems) {
         val left = item.box.left * scaleX
         val top = item.box.top * scaleY
         val right = item.box.right * scaleX
         val bottom = item.box.bottom * scaleY
-        val boxColor = if (item.distanceCm < 95) Color(0xFFFF3B30) else Color(0xFF00E5FF)
+        val boxColor = if (item.distanceCm < 55) Color(0xFFFF3B30) else Color(0xFF00E5FF)
 
         drawRect(
             color = boxColor,
@@ -516,33 +659,30 @@ fun FullscreenRobotVisionUi(
         )
       }
 
-      // Teken Vloer-Scan Zone onderin
       val floorColor = if (navPoints.floorOk) Color(0x5500FF66) else Color(0x88FF2222)
       drawRect(
           color = floorColor,
-          topLeft = Offset(size.width * 0.30f, size.height * 0.82f),
-          size = Size(size.width * 0.40f, size.height * 0.14f),
+          topLeft = Offset(size.width * 0.28f, size.height * 0.82f),
+          size = Size(size.width * 0.44f, size.height * 0.14f),
           style = Stroke(width = 4f),
       )
 
-      // Helper om de 5 navigatie-vizieren te tekenen (Groen = Vrij, Rood = Geblokkeerd)
-      fun drawNavDot(xRatio: Float, yRatio: Float, isFree: Boolean, tag: String) {
-        val cx = size.width * xRatio
-        val cy = size.height * yRatio
-        val dotColor = if (isFree) Color(0xFF00FF66) else Color(0xFFFF2222)
+      fun drawNavSensor(pt: SensorPoint) {
+        val cx = size.width * pt.xRatio
+        val cy = size.height * pt.yRatio
+        val dotColor = if (pt.isFree) Color(0xFF00FF66) else Color(0xFFFF2222)
         drawCircle(color = dotColor, radius = 22f, center = Offset(cx, cy))
         drawCircle(color = Color.White, radius = 26f, center = Offset(cx, cy), style = Stroke(3f))
-        drawContext.canvas.nativeCanvas.drawText(tag, cx - 12f, cy + 52f, textPaint)
+        drawContext.canvas.nativeCanvas.drawText("${pt.tag}:${pt.distanceCm}cm", cx - 35f, cy + 52f, textPaint)
       }
 
-      drawNavDot(0.50f, 0.25f, navPoints.topMidFree, "T")
-      drawNavDot(0.50f, 0.52f, navPoints.midFree, "M")
-      drawNavDot(0.50f, 0.78f, navPoints.botMidFree, "B")
-      drawNavDot(0.20f, 0.55f, navPoints.leftFree, "L")
-      drawNavDot(0.80f, 0.55f, navPoints.rightFree, "R")
+      drawNavSensor(navPoints.topMid)
+      drawNavSensor(navPoints.mid)
+      drawNavSensor(navPoints.botMid)
+      drawNavSensor(navPoints.left)
+      drawNavSensor(navPoints.right)
     }
 
-    // 3. ZWEVENDE ROBOT STATUS BALK BOVENIN
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
@@ -558,7 +698,6 @@ fun FullscreenRobotVisionUi(
       )
     }
 
-    // 4. COMPACTE KNOPPEN ONDERIN (Zwevend over het fullscreen beeld)
     Row(
         modifier = Modifier
             .align(Alignment.BottomCenter)
