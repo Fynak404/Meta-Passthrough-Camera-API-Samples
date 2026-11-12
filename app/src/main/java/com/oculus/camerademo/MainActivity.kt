@@ -115,7 +115,7 @@ class MainActivity : ComponentActivity() {
   private var udpSocket: DatagramSocket? = null
   private val espIpAddress = "192.168.4.1"
   private val espPort = 4210
-  private val safeThresholdCm = 55 // <= 55cm turns RED and triggers turn
+  private val safeThresholdCm = 60 // Rood onder 60cm
 
   private val realObjectHeightsCm = mapOf(
       "person" to 170f,
@@ -142,7 +142,7 @@ class MainActivity : ComponentActivity() {
         override fun run() {
           if (isCameraRunning) {
             grabFrameAndDetect()
-            copyHandler.postDelayed(this, 110)
+            copyHandler.postDelayed(this, 100) // Snelle 10 FPS loop
           }
         }
       }
@@ -150,6 +150,7 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
+    // FORCEER TRUE IMMERSIVE FULLSCREEN (Geen randen, geen statusbalken)
     WindowCompat.setDecorFitsSystemWindows(window, false)
     val controller = WindowInsetsControllerCompat(window, window.decorView)
     controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -195,10 +196,10 @@ class MainActivity : ComponentActivity() {
               .setBaseOptions(baseOptions)
               .setRunningMode(RunningMode.IMAGE)
               .setMaxResults(8)
-              .setScoreThreshold(0.50f)
+              .setScoreThreshold(0.45f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "3D Stereo Vision Loaded"
+      aiStatusState.value = "Immersive 3D Vision Loaded"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
@@ -230,19 +231,21 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  // Anti-Jitter Filter: Mediaan + EMA (Voorkomt uitschieters naar 40cm of max)
   private fun stabilizeCm(tag: String, rawCm: Int): Int {
-    val clamped = rawCm.coerceIn(15, 300)
+    val clamped = rawCm.coerceIn(20, 300)
     val hist = pointHistory.getOrPut(tag) { ArrayDeque() }
     hist.addLast(clamped)
-    if (hist.size > 5) hist.removeFirst()
+    if (hist.size > 6) hist.removeFirst()
 
     val median = hist.sorted()[hist.size / 2].toFloat()
     val prevEma = pointEma[tag] ?: median
-    val smoothed = (prevEma * 0.65f) + (median * 0.35f)
+    val smoothed = (prevEma * 0.60f) + (median * 0.40f)
     pointEma[tag] = smoothed
     return smoothed.roundToInt()
   }
 
+  // Robuuste 3D Stereo Match met strenge variantie- en contrastkeuring
   private fun computeStereoPointDistanceCm(
       stereo: StereoFramePair,
       xRatio: Float,
@@ -254,8 +257,8 @@ class MainActivity : ComponentActivity() {
     val ry = (h * yRatio).toInt()
 
     val halfPatch = 8
-    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 18f).toInt().coerceIn(40, w / 3)
-    val minDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 300f).toInt().coerceAtLeast(2)
+    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 20f).toInt().coerceIn(30, w / 3)
+    val minDisp = 3
 
     if (ry < halfPatch + 4 || ry >= h - halfPatch - 4) return null
     if (rx < halfPatch + 4 || rx + maxDisp >= w - halfPatch - 4) return null
@@ -278,11 +281,13 @@ class MainActivity : ComponentActivity() {
         rVar += abs(diff)
       }
     }
-    if (rVar / count < 3) return null
+    // Als de patch te eg dan is er geen diepte te berekenen (voorkomt foute 40cm jumps)
+    if (rVar / count < 4) return null
 
     var bestDisp = -1
     var bestSad = Int.MAX_VALUE
     var secondBestSad = Int.MAX_VALUE
+
     for (d in minDisp..maxDisp) {
       val lx = rx + d
       var bestRowSad = Int.MAX_VALUE
@@ -315,10 +320,12 @@ class MainActivity : ComponentActivity() {
         secondBestSad = bestRowSad
       }
     }
+
     if (bestDisp <= 0) return null
-    if (secondBestSad < (bestSad * 1.08f).toInt()) return null
+    if (secondBestSad < (bestSad * 1.12f).toInt()) return null // Uniqueness check
+
     val distanceCm = ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt()
-    return distanceCm.coerceIn(15, 300)
+    return distanceCm.coerceIn(20, 350)
   }
 
   private fun measurePoint(
@@ -332,10 +339,10 @@ class MainActivity : ComponentActivity() {
     val px = lastImageWidth * xRatio
     val py = lastImageHeight * yRatio
     val coveringObj = items.filter { item ->
-      px >= (item.box.left - 12f) &&
-          px <= (item.box.right + 12f) &&
-          py >= (item.box.top - 12f) &&
-          py <= (item.box.bottom + 12f)
+      px >= (item.box.left - 15f) &&
+          px <= (item.box.right + 15f) &&
+          py >= (item.box.top - 15f) &&
+          py <= (item.box.bottom + 15f)
     }.minByOrNull { item -> item.distanceCm }
 
     val rawCm = when {
@@ -365,6 +372,7 @@ class MainActivity : ComponentActivity() {
     var totalSamples = 0
     var lumaSum = 0L
     val lumas = mutableListOf<Int>()
+
     for (y in startY until endY step 4) {
       for (x in startX until endX step 4) {
         val c = bitmap.getPixel(x, y)
@@ -375,22 +383,20 @@ class MainActivity : ComponentActivity() {
         lumaSum += luma
         lumas.add(luma)
         totalSamples++
-        val qR = r / 48
-        val qG = g / 48
-        val qB = b / 48
-        val bucketKey = (qR shl 8) or (qG shl 4) or qB
+        val bucketKey = ((r / 48) shl 8) or ((g / 48) shl 4) or (b / 48)
         colorBuckets[bucketKey] = (colorBuckets[bucketKey] ?: 0) + 1
       }
     }
     if (totalSamples == 0) return Pair(true, "CLEAN")
     val avgLuma = (lumaSum / totalSamples).toInt()
-    val minClusterSize = (totalSamples * 0.07f).toInt()
+    val minClusterSize = (totalSamples * 0.08f).toInt()
     val significantColors = colorBuckets.values.count { it >= minClusterSize }
-    val darkPixels = lumas.count { it < 42 && (avgLuma - it) > 45 }
+    val darkPixels = lumas.count { it < 45 && (avgLuma - it) > 50 }
     val darkRatio = darkPixels.toFloat() / totalSamples.toFloat()
+
     return when {
-      darkRatio > 0.08f -> Pair(false, "DARK OBJECT")
-      significantColors >= 3 -> Pair(false, "CLUTTER ($significantColors COLORS)")
+      darkRatio > 0.09f -> Pair(false, "VLOER OBSTAKEL")
+      significantColors >= 3 -> Pair(false, "VLOER CLUTTER")
       else -> Pair(true, "CLEAN")
     }
   }
@@ -432,7 +438,7 @@ class MainActivity : ComponentActivity() {
                 computeStereoPointDistanceCm(stereoPair, centerXRatio, centerYRatio)
               } else null
               val fallbackCm = if (box.height() >= 18f) {
-                (((realObjectHeightsCm[name] ?: 55f) * 540f) / box.height()).toInt().coerceIn(15, 300)
+                (((realObjectHeightsCm[name] ?: 55f) * 540f) / box.height()).toInt().coerceIn(20, 300)
               } else 300
               DetectedItem(
                   label = name,
@@ -445,11 +451,12 @@ class MainActivity : ComponentActivity() {
         val floorCheck = analyzeFloorSafety(bitmap)
         val floorOk = floorCheck.first
         val floorReason = floorCheck.second
+
         val ptT = measurePoint("T", 0.50f, 0.25f, stereoPair, items)
         val ptM = measurePoint("M", 0.50f, 0.50f, stereoPair, items)
         val rawBot = measurePoint("B", 0.50f, 0.74f, stereoPair, items)
-        val ptB = if (!floorOk && rawBot.distanceCm > 40) {
-          rawBot.copy(distanceCm = 40, isFree = false)
+        val ptB = if (!floorOk && rawBot.distanceCm > 45) {
+          rawBot.copy(distanceCm = 35, isFree = false)
         } else {
           rawBot
         }
@@ -559,13 +566,13 @@ class MainActivity : ComponentActivity() {
     checkPermissions()
     val surface = previewSurface
     if (surface == null) {
-      Toast.makeText(this, "Something went wrong - surface is not ready", Toast.LENGTH_SHORT).show()
+      Toast.makeText(this, "Surface is niet gereed", Toast.LENGTH_SHORT).show()
       return
     }
     viewModel.startCamera(surface)
     isCameraRunning = true
     copyHandler.removeCallbacks(frameGrabber)
-    copyHandler.postDelayed(frameGrabber, 500)
+    copyHandler.postDelayed(frameGrabber, 300)
   }
 
   private fun onStopCamera() {
@@ -573,7 +580,7 @@ class MainActivity : ComponentActivity() {
     copyHandler.removeCallbacks(frameGrabber)
     viewModel.stopCamera()
     detectedItemsState.value = emptyList()
-    aiStatusState.value = "AI Stopped"
+    aiStatusState.value = "Vision Gestopt"
   }
 
   private fun onExit() {
@@ -589,7 +596,7 @@ class MainActivity : ComponentActivity() {
             PermissionManager.HZOS_CAMERA_PERMISSION,
         )
     ) {
-      Toast.makeText(this, "Missing required permissions", Toast.LENGTH_SHORT).show()
+      Toast.makeText(this, "Mist benodigde permissies", Toast.LENGTH_SHORT).show()
     }
   }
 }
@@ -608,6 +615,7 @@ fun FullscreenRobotVisionUi(
     onExit: () -> Unit,
 ) {
   Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
+    // 1. 100% IMMERSIVE FULLSCREEN PASSTHROUGH VIEW
     AndroidView(
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
@@ -628,12 +636,13 @@ fun FullscreenRobotVisionUi(
         },
     )
 
+    // 2. AR HUD OVERLAY (Boxen + 5 Meetpunten + Vloerzone)
     Canvas(modifier = Modifier.fillMaxSize()) {
       val scaleX = size.width / 640f
       val scaleY = size.height / 480f
       val textPaint = Paint().apply {
         color = AndroidColor.WHITE
-        textSize = 38f
+        textSize = 36f
         isAntiAlias = true
         setShadowLayer(6f, 2f, 2f, AndroidColor.BLACK)
       }
@@ -643,7 +652,7 @@ fun FullscreenRobotVisionUi(
         val top = item.box.top * scaleY
         val right = item.box.right * scaleX
         val bottom = item.box.bottom * scaleY
-        val boxColor = if (item.distanceCm < 55) Color(0xFFFF3B30) else Color(0xFF00E5FF)
+        val boxColor = if (item.distanceCm < 60) Color(0xFFFF3B30) else Color(0xFF00E5FF)
 
         drawRect(
             color = boxColor,
@@ -683,26 +692,28 @@ fun FullscreenRobotVisionUi(
       drawNavSensor(navPoints.right)
     }
 
+    // 3. ZWEVENDE STATUS BAR BOVENIN
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
-            .padding(top = 16.dp)
+            .padding(top = 24.dp)
             .background(Color(0xAA000000), RoundedCornerShape(12.dp))
-            .padding(horizontal = 20.dp, vertical = 10.dp)
+            .padding(horizontal = 24.dp, vertical = 12.dp)
     ) {
       Text(
           text = aiStatus,
           color = Color(0xFF00FF66),
-          fontSize = 20.sp,
+          fontSize = 18.sp,
           fontWeight = FontWeight.Bold,
       )
     }
 
+    // 4. BESTURINGSKNOPPEN ONDERIN
     Row(
         modifier = Modifier
             .align(Alignment.BottomCenter)
             .fillMaxWidth()
-            .padding(bottom = 16.dp),
+            .padding(bottom = 24.dp),
         horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
     ) {
       Button(
