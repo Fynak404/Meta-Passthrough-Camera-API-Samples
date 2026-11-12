@@ -44,12 +44,16 @@ import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.objectdetector.ObjectDetector
 import com.oculus.camerademo.ui.theme.CameraDemoTheme
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
 import java.util.concurrent.Executors
 
 data class DetectedItem(
     val label: String,
     val score: Float,
     val box: RectF,
+    val distanceCm: Int = 0,
 )
 
 class MainActivity : ComponentActivity() {
@@ -68,13 +72,40 @@ class MainActivity : ComponentActivity() {
   private var previewSurface: Surface? = null
   private var objectDetector: ObjectDetector? = null
   private val aiExecutor = Executors.newSingleThreadExecutor()
+  private val networkExecutor = Executors.newSingleThreadExecutor()
   private val copyHandler = Handler(Looper.getMainLooper())
   private var isDetecting = false
   private var isCameraRunning = false
   private var lastImageWidth = 640
   private var lastImageHeight = 480
   private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
-  private val aiStatusState = mutableStateOf("AI Ready")
+  private val aiStatusState = mutableStateOf("Robot Vision Ready")
+
+  // --- ROBOT VISION & ESP32 SETTINGS ---
+  private var udpSocket: DatagramSocket? = null
+  private val espIpAddress = "192.168.4.1" // Default ESP32 Hotspot IP
+  private val espPort = 4210
+  private val cameraFocalLengthPx = 540f // Calibrated for Quest 3 640x480 crop
+
+  // Real-world average heights in cm for COCO objects
+  private val realObjectHeightsCm = mapOf(
+      "person" to 170f,
+      "chair" to 85f,
+      "couch" to 85f,
+      "dining table" to 75f,
+      "bed" to 65f,
+      "tv" to 60f,
+      "laptop" to 25f,
+      "cell phone" to 15f,
+      "bottle" to 22f,
+      "cup" to 12f,
+      "backpack" to 45f,
+      "book" to 24f,
+      "potted plant" to 40f
+  )
+
+  private var lastLockedLabel = ""
+  private var consecutiveFrameCount = 0
 
   private val frameGrabber =
       object : Runnable {
@@ -88,6 +119,9 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+    try {
+      udpSocket = DatagramSocket()
+    } catch (_: Exception) {}
     setupObjectDetector()
 
     viewModel.uiState.observe(this) { uiState ->
@@ -123,11 +157,11 @@ class MainActivity : ComponentActivity() {
           ObjectDetector.ObjectDetectorOptions.builder()
               .setBaseOptions(baseOptions)
               .setRunningMode(RunningMode.IMAGE)
-              .setMaxResults(6)
-              .setScoreThreshold(0.35f)
+              .setMaxResults(5)
+              .setScoreThreshold(0.55f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "AI Model Loaded"
+      aiStatusState.value = "Robot Vision Loaded"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
@@ -159,6 +193,26 @@ class MainActivity : ComponentActivity() {
     }
   }
 
+  private fun estimateDistanceCm(label: String, box: RectF): Int {
+    val boxHeightPx = box.height().coerceAtLeast(1f)
+    val realHeight = realObjectHeightsCm[label] ?: 50f
+    return ((realHeight * cameraFocalLengthPx) / boxHeightPx).toInt()
+  }
+
+  private fun sendUdpToEsp32(payload: String) {
+    val socket = udpSocket ?: return
+    networkExecutor.execute {
+      try {
+        val bytes = payload.toByteArray()
+        val address = InetAddress.getByName(espIpAddress)
+        val packet = DatagramPacket(bytes, bytes.size, address, espPort)
+        socket.send(packet)
+      } catch (_: Exception) {
+        // Silently ignore when ESP32 is not connected yet
+      }
+    }
+  }
+
   private fun runAiDetection(bitmap: Bitmap) {
     val detector = objectDetector ?: run {
       isDetecting = false
@@ -174,17 +228,53 @@ class MainActivity : ComponentActivity() {
         val items =
             result.detections().mapNotNull { detection ->
               val category = detection.categories().firstOrNull() ?: return@mapNotNull null
+              val name = category.categoryName()
+              val box = detection.boundingBox()
               DetectedItem(
-                  label = category.categoryName(),
+                  label = name,
                   score = category.score(),
-                  box = detection.boundingBox(),
+                  box = box,
+                  distanceCm = estimateDistanceCm(name, box),
               )
             }
-        runOnUiThread {
-          detectedItemsState.value = items
-          aiStatusState.value =
-              if (items.isEmpty()) "AI Scanning (0 objects)"
-              else items.joinToString(", ") { "${it.label} ${(it.score * 100).toInt()}%" }
+
+        val primaryTarget = items.minByOrNull { it.distanceCm }
+
+        if (primaryTarget != null) {
+          if (primaryTarget.label == lastLockedLabel) {
+            consecutiveFrameCount++
+          } else {
+            lastLockedLabel = primaryTarget.label
+            consecutiveFrameCount = 1
+          }
+
+          val centerX = primaryTarget.box.centerX()
+          val screenCenter = lastImageWidth / 2f
+          val offsetPercent = (((centerX - screenCenter) / screenCenter) * 100).toInt()
+
+          val action = when {
+            primaryTarget.distanceCm < 50 -> "STOP"
+            offsetPercent < -20 -> "LEFT"
+            offsetPercent > 20 -> "RIGHT"
+            else -> "FORWARD"
+          }
+
+          if (consecutiveFrameCount >= 2) {
+            sendUdpToEsp32("${primaryTarget.label},${primaryTarget.distanceCm},$action,$offsetPercent")
+          }
+
+          runOnUiThread {
+            detectedItemsState.value = items
+            aiStatusState.value =
+                "ROBOT: ${primaryTarget.label} | ${primaryTarget.distanceCm}cm | $action ($offsetPercent%)"
+          }
+        } else {
+          consecutiveFrameCount = 0
+          sendUdpToEsp32("none,999,CLEAR,0")
+          runOnUiThread {
+            detectedItemsState.value = emptyList()
+            aiStatusState.value = "ROBOT: Clear Path (Scanning...)"
+          }
         }
       } catch (e: Exception) {
         runOnUiThread { aiStatusState.value = "Detect err: ${e.message}" }
@@ -234,6 +324,8 @@ class MainActivity : ComponentActivity() {
     super.onDestroy()
     objectDetector?.close()
     aiExecutor.shutdown()
+    networkExecutor.shutdown()
+    udpSocket?.close()
   }
 
   private fun onStartCamera() {
@@ -373,7 +465,7 @@ class MainActivity : ComponentActivity() {
                 style = Stroke(width = 4.dp.toPx()),
             )
 
-            val labelText = "${item.label} ${(item.score * 100).toInt()}%"
+            val labelText = "${item.label} (${item.distanceCm}cm) ${(item.score * 100).toInt()}%"
             val textY = (top - 8f).coerceAtLeast(36f)
             drawContext.canvas.nativeCanvas.drawText(labelText, left, textY, textPaint)
           }
