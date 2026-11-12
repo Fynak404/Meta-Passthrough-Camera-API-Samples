@@ -297,36 +297,35 @@ class MainActivity : ComponentActivity() {
             },
         )
 
-        Canvas(modifier = Modifier.fillMaxSize()) {
+                Canvas(modifier = Modifier.fillMaxSize()) {
           val scaleX = size.width / lastImageWidth.toFloat().coerceAtLeast(1f)
           val scaleY = size.height / lastImageHeight.toFloat().coerceAtLeast(1f)
 
           val textPaint =
               android.graphics.Paint().apply {
-              color = android.graphics.Color.GREEN
-              textSize = 36f
-              isFakeBoldText = true
+                color = android.graphics.Color.GREEN
+                textSize = 36f
+                isFakeBoldText = true
               }
-            for (item in detectedItems) {
+
+          for (item in detectedItems) {
             val left = item.box.left * scaleX
             val top = item.box.top * scaleY
             val right = item.box.right * scaleX
             val bottom = item.box.bottom * scaleY
+
             drawRect(
-            color = Color.Green,
-            topLeft = Offset(left, top),
-            size = Size(right - left, bottom - top),
-            style = Stroke(width = 4.dp.toPx()),
-           )
-            drawContext.canvas.nativeCanvas.drawText(
-            "${item.label} ${(item.score * 100).toInt()}%",
-            left,
-            (top - 8f).coerceAtLeast(36f),
-            textPaint,
-                    }
-              }
-            },
-        )
+                color = Color.Green,
+                topLeft = Offset(left, top),
+                size = Size(right - left, bottom - top),
+                style = Stroke(width = 4.dp.toPx()),
+            )
+
+            val labelText = "${item.label} ${(item.score * 100).toInt()}%"
+            val textY = (top - 8f).coerceAtLeast(36f)
+            drawContext.canvas.nativeCanvas.drawText(labelText, left, textY, textPaint)
+          }
+        }
       }
     }
   }
