@@ -101,7 +101,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
   private val _eventLiveData = MutableLiveData<CameraEvent>(CameraEvent.Empty)
   val cameraEvents: LiveData<CameraEvent> = _eventLiveData
 
-  // Latest synchronized Y-plane buffers for stereo depth
   private val stereoLock = Any()
   private var latestLeftY: ByteArray? = null
   private var latestRightY: ByteArray? = null
@@ -139,7 +138,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
       )
     }
 
-    // Calculate real physical stereo baseline (in cm) between Left and Right Quest 3 cameras
     val lCfg = cameraConfigs.find { it.position == Position.Left }
     val rCfg = cameraConfigs.find { it.position == Position.Right }
     if (lCfg != null && rCfg != null && lCfg.lensTranslation.size >= 3 && rCfg.lensTranslation.size >= 3) {
@@ -152,7 +150,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
       }
     }
 
-    // Read real camera focal length in pixels if available
     if (rCfg != null && rCfg.width > 0) {
       try {
         val chars = cameraManager.getCameraCharacteristics(rCfg.id)
@@ -166,7 +163,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
         stereoFocalPx = rCfg.width * 0.44f
       }
     }
-
     logConfigs(cameraConfigs)
   }
 
@@ -292,9 +288,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
     return out
   }
 
-  private fun getBrightness(buffer: ByteBuffer, width: Int, height: Int): Int {
-    return 128 // Simple placeholder for brightness calculation if needed
-  }
+  private fun getBrightness(buffer: ByteBuffer, width: Int, height: Int): Int = 128
 
   private fun openDualStereoCameras(previewSurface: Surface) {
     val permissionRequestState = _permissionRequestState.value ?: return
@@ -302,22 +296,15 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
       postEvent("Missing required permissions")
       return
     }
-    if (cameraConfigs.isEmpty()) {
-      logv("No Camera Configs found. Unable to open cameras.")
-      return
-    }
+    if (cameraConfigs.isEmpty()) return
     val rCfg = cameraConfigs.find { it.position == Position.Right }
     val lCfg = cameraConfigs.find { it.position == Position.Left }
-    if (rCfg == null) {
-      loge("Right Camera not found.")
-      return
-    }
+    if (rCfg == null) return
     rightConfig = rCfg
     leftConfig = lCfg
     stereoWidth = rCfg.width
     stereoHeight = rCfg.height
 
-    // 1. Setup Right Camera (Preview + Stereo Right Eye)
     rightImageReader =
         ImageReader.newInstance(
             rCfg.width,
@@ -327,13 +314,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
         ).apply {
           onLatestImage(imageReaderHandler) { image ->
             val yBytes = extractYPlane(image, rCfg.width, rCfg.height)
-            synchronized(stereoLock) {
-              latestRightY = yBytes
-            }
-            val brightness = getBrightness(image.planes[0].buffer, rCfg.width, rCfg.height)
-            mainHandler.post {
-              _uiState.value = _uiState.value?.copy(cameraBrightness = brightness.toFloat())
-            }
+            synchronized(stereoLock) { latestRightY = yBytes }
           }
         }
 
@@ -360,33 +341,21 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
                             addTarget(previewSurface)
                           }
                           session.setRepeatingRequest(req.build(), null, cameraHandler)
-                          postEvent("Dual 3D Stereo Vision Active!")
+                          postEvent("Immersive 3D Stereo Active!")
                         }
-                        override fun onConfigureFailed(session: CameraCaptureSession) {
-                          loge("Failed to configure Right camera session")
-                        }
+                        override fun onConfigureFailed(session: CameraCaptureSession) {}
                       },
                   ),
               )
-            } catch (err: Exception) {
-              loge(err.message)
-            }
+            } catch (_: Exception) {}
           }
-          override fun onDisconnected(camera: CameraDevice) {
-            resetState()
-          }
-          override fun onClosed(camera: CameraDevice) {
-            postEvent("Camera stopped")
-            super.onClosed(camera)
-          }
-          override fun onError(camera: CameraDevice, error: Int) {
-            loge("Right camera error: $error")
-          }
+          override fun onDisconnected(camera: CameraDevice) { resetState() }
+          override fun onClosed(camera: CameraDevice) { super.onClosed(camera) }
+          override fun onError(camera: CameraDevice, error: Int) {}
         },
         cameraHandler,
     )
 
-    // 2. Setup Left Camera (Stereo Left Eye for True 3D Depth Triangulation)
     if (lCfg != null && lCfg.width == rCfg.width && lCfg.height == rCfg.height) {
       leftImageReader =
           ImageReader.newInstance(
@@ -397,9 +366,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
           ).apply {
             onLatestImage(imageReaderHandler) { image ->
               val yBytes = extractYPlane(image, lCfg.width, lCfg.height)
-              synchronized(stereoLock) {
-                latestLeftY = yBytes
-              }
+              synchronized(stereoLock) { latestLeftY = yBytes }
             }
           }
 
@@ -423,22 +390,14 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
                             }
                             session.setRepeatingRequest(req.build(), null, cameraHandler)
                           }
-                          override fun onConfigureFailed(session: CameraCaptureSession) {
-                            loge("Failed to configure Left stereo camera session")
-                          }
+                          override fun onConfigureFailed(session: CameraCaptureSession) {}
                         },
                     ),
                 )
-              } catch (err: Exception) {
-                loge(err.message)
-              }
+              } catch (_: Exception) {}
             }
-            override fun onDisconnected(camera: CameraDevice) {
-              leftCamera = null
-            }
-            override fun onError(camera: CameraDevice, error: Int) {
-              loge("Left camera error: $error")
-            }
+            override fun onDisconnected(camera: CameraDevice) { leftCamera = null }
+            override fun onError(camera: CameraDevice, error: Int) {}
           },
           cameraHandler,
       )
@@ -452,13 +411,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
 
   private fun logConfigs(configs: List<CameraConfig>) {
     for (config in configs) {
-      logv("***** Camera ID ****** ${config.id}")
-      logv(" ***** Width ****** ${config.width}")
-      logv(" ***** Height ****** ${config.height}")
-      logv(" ***** Lens Translation ****** ${arrayToString(config.lensTranslation)}")
-      logv(" ***** Lens Rotation ****** ${arrayToString(config.lensRotation)}")
-      logv(" ***** Handedness ****** ${config.position}")
-      logv(" ***** is passthrough camera ****** ${config.isPassthrough}")
+      logv("Camera ID: ${config.id} | Size: ${config.width}x${config.height} | Pos: ${config.position}")
     }
   }
 
