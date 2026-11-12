@@ -155,7 +155,7 @@ class MainActivity : ComponentActivity() {
       Row(horizontalArrangement = Arrangement.SpaceBetween) {
         Button(
             onClick = onStartCamera,
-            contentDescription = stringResource(R.string.button_description_start_camera),
+            //contentDescription = stringResource(R.string.button_description_start_camera),
         ) {
           Text("Start camera")
         }
@@ -171,7 +171,7 @@ class MainActivity : ComponentActivity() {
       Row(horizontalArrangement = Arrangement.SpaceEvenly) {
         Button(
             onClick = onStopCamera,
-            contentDescription = stringResource(R.string.button_description_stop_camera),
+            //contentDescription = stringResource(R.string.button_description_stop_camera),
         ) {
           Text("Stop camera")
         }
@@ -179,7 +179,7 @@ class MainActivity : ComponentActivity() {
       Row(horizontalArrangement = Arrangement.SpaceEvenly) {
         Button(
             onClick = onExit,
-            contentDescription = stringResource(R.string.button_description_exit),
+            //contentDescription = stringResource(R.string.button_description_exit),
         ) {
           Text("Exit")
         }
