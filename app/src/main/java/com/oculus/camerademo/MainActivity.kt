@@ -4,21 +4,48 @@ package com.oculus.camerademo
 
 import android.graphics.Bitmap
 import android.graphics.Color as AndroidColor
+import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.SurfaceTexture
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.view.PixelCopy
 import android.view.Surface
+import android.view.TextureView
+import android.view.TextureView.SurfaceTextureListener
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Scaffold
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.ViewModelProvider
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
@@ -36,6 +63,15 @@ data class DetectedItem(
     val score: Float,
     val box: RectF,
     val distanceCm: Int = 0,
+)
+
+data class NavPointsStatus(
+    val topMidFree: Boolean = true,
+    val midFree: Boolean = true,
+    val botMidFree: Boolean = true,
+    val leftFree: Boolean = true,
+    val rightFree: Boolean = true,
+    val floorOk: Boolean = true,
 )
 
 class MainActivity : ComponentActivity() {
@@ -62,6 +98,7 @@ class MainActivity : ComponentActivity() {
   private var lastImageHeight = 480
   private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
   private val aiStatusState = mutableStateOf("Robot Vision Ready")
+  private val navPointsState = mutableStateOf(NavPointsStatus())
 
   // --- ESP32 & CAMERA KALIBRATIE ---
   private var udpSocket: DatagramSocket? = null
@@ -85,7 +122,6 @@ class MainActivity : ComponentActivity() {
       "potted plant" to 40f
   )
 
-  // Smoothing voor stabiele cm-meting en draairichting
   private val distanceHistory = ArrayDeque<Int>()
   private var lockedTurnDirection = "NONE"
 
@@ -101,6 +137,13 @@ class MainActivity : ComponentActivity() {
 
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
+
+    // Verberg statusbalken voor 100% edge-to-edge fullscreen
+    WindowCompat.setDecorFitsSystemWindows(window, false)
+    val controller = WindowInsetsControllerCompat(window, window.decorView)
+    controller.hide(WindowInsetsCompat.Type.systemBars())
+    controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+
     try {
       udpSocket = DatagramSocket()
     } catch (_: Exception) {}
@@ -109,17 +152,18 @@ class MainActivity : ComponentActivity() {
     viewModel.uiState.observe(this) { uiState ->
       setContent {
         CameraDemoTheme {
-          Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
-            CameraDemoUi(
-                modifier = Modifier.fillMaxSize().padding(innerPadding),
-                cameraState = uiState,
-                detectedItems = detectedItemsState.value,
-                aiStatus = aiStatusState.value,
-                onStartCamera = { onStartCamera() },
-                onStopCamera = { onStopCamera() },
-                onExit = { onExit() },
-            )
-          }
+          FullscreenRobotVisionUi(
+              modifier = Modifier.fillMaxSize(),
+              cameraState = uiState,
+              detectedItems = detectedItemsState.value,
+              navPoints = navPointsState.value,
+              aiStatus = aiStatusState.value,
+              onSurfaceReady = { surface -> previewSurface = surface },
+              onSurfaceDestroyed = { previewSurface = null },
+              onStartCamera = { onStartCamera() },
+              onStopCamera = { onStopCamera() },
+              onExit = { onExit() },
+          )
         }
       }
     }
@@ -178,7 +222,6 @@ class MainActivity : ComponentActivity() {
   private fun estimateRealisticDistanceCm(label: String, box: RectF): Int {
     val boxHeightPx = box.height()
     if (boxHeightPx < 18f) return 350
-
     val realHeight = realObjectHeightsCm[label] ?: 55f
     val rawCm = ((realHeight * cameraFocalLengthPx) / boxHeightPx).toInt()
     return rawCm.coerceIn(15, 350)
@@ -213,8 +256,7 @@ class MainActivity : ComponentActivity() {
     }
 
     if (sampleCount == 0) return true
-    val edgeRatio = edgeCount.toFloat() / sampleCount.toFloat()
-    return edgeRatio < 0.14f
+    return (edgeCount.toFloat() / sampleCount.toFloat()) < 0.14f
   }
 
   private fun sendUdpToEsp32(payload: String) {
@@ -257,7 +299,6 @@ class MainActivity : ComponentActivity() {
 
         val w = lastImageWidth.toFloat()
         val h = lastImageHeight.toFloat()
-
         val ptTopMid = Pair(w * 0.50f, h * 0.25f)
         val ptMid = Pair(w * 0.50f, h * 0.52f)
         val ptBotMid = Pair(w * 0.50f, h * 0.78f)
@@ -283,7 +324,6 @@ class MainActivity : ComponentActivity() {
 
         val centerPathClear = topMidFree && midFree && botMidFree
         val command: String
-
         if (centerPathClear) {
           lockedTurnDirection = "NONE"
           command = "FORWARD"
@@ -310,16 +350,14 @@ class MainActivity : ComponentActivity() {
         }
 
         val whatIsIt = closest?.label ?: (if (!floorOk) "floor_obstacle" else "clear")
-
         val pBits = "${if (topMidFree) 1 else 0}${if (midFree) 1 else 0}${if (botMidFree) 1 else 0}${if (leftFree) 1 else 0}${if (rightFree) 1 else 0}"
         sendUdpToEsp32("CMD:$command|OBJ:$whatIsIt|CM:$smoothedCm|PTS:$pBits")
 
-        val hudPoints = "T:${if (topMidFree) "O" else "X"} M:${if (midFree) "O" else "X"} B:${if (botMidFree) "O" else "X"} | L:${if (leftFree) "O" else "X"} R:${if (rightFree) "O" else "X"}"
         val objectText = if (closest != null) "${closest.label} (~${smoothedCm}cm)" else (if (!floorOk) "VLOER OBSTAKEL!" else "Vrij")
-
         runOnUiThread {
           detectedItemsState.value = items
-          aiStatusState.value = "[$command] | $hudPoints | Ziet: $objectText"
+          navPointsState.value = NavPointsStatus(topMidFree, midFree, botMidFree, leftFree, rightFree, floorOk)
+          aiStatusState.value = "[$command]  |  Ziet: $objectText"
         }
       } catch (e: Exception) {
         runOnUiThread { aiStatusState.value = "Detect err: ${e.message}" }
@@ -372,11 +410,7 @@ class MainActivity : ComponentActivity() {
   }
 
   private fun onStartCamera() {
-    val permissionManager = PermissionManager()
-    if (!permissionManager.checkPermissions(this, android.Manifest.permission.CAMERA, PermissionManager.HZOS_CAMERA_PERMISSION)) {
-      Toast.makeText(this, "Missing required permissions", Toast.LENGTH_SHORT).show()
-      return
-    }
+    checkPermissions()
     val surface = previewSurface
     if (surface == null) {
       Toast.makeText(this, "Something went wrong - surface is not ready", Toast.LENGTH_SHORT).show()
@@ -391,15 +425,163 @@ class MainActivity : ComponentActivity() {
   private fun onStopCamera() {
     isCameraRunning = false
     copyHandler.removeCallbacks(frameGrabber)
-    viewModel.stopCamera()
-    detectedItemsState.value = emptyList()
-    aiStatusState.value = "AI Stopped"
+    viewModel.stopModelCamera()
   }
 
   private fun onExit() {
-    isCameraRunning = false
-    copyHandler.removeCallbacks(frameGrabber)
-    viewModel.shutdown()
+    onStopCamera()
     finish()
+  }
+
+  private fun checkPermissions() {
+    if (
+        !permissionManager.checkPermissions(
+            this,
+            android.Manifest.permission.CAMERA,
+            PermissionManager.HZOS_CAMERA_PERMISSION,
+        )
+    ) {
+      Toast.makeText(this, "Missing required permissions", Toast.LENGTH_SHORT).show()
+    }
+  }
+}
+
+@Composable
+fun FullscreenRobotVisionUi(
+    modifier: Modifier = Modifier,
+    cameraState: Any,
+    detectedItems: List<DetectedItem>,
+    navPoints: NavPointsStatus,
+    aiStatus: String,
+    onSurfaceReady: (Surface) -> Unit,
+    onSurfaceDestroyed: () -> Unit,
+    onStartCamera: () -> Unit,
+    onStopCamera: () -> Unit,
+    onExit: () -> Unit,
+) {
+  Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
+    // 1. 100% FULLSCREEN CAMERA FEED
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { context ->
+          TextureView(context).apply {
+            surfaceTextureListener =
+                object : SurfaceTextureListener {
+                  override fun onSurfaceTextureAvailable(surface: SurfaceTexture, w: Int, h: Int) {
+                    onSurfaceReady(Surface(surface))
+                  }
+                  override fun onSurfaceTextureSizeChanged(surface: SurfaceTexture, w: Int, h: Int) {}
+                  override fun onSurfaceTextureDestroyed(surface: SurfaceTexture): Boolean {
+                    onSurfaceDestroyed()
+                    return true
+                  }
+                  override fun onSurfaceTextureUpdated(surface: SurfaceTexture) {}
+                }
+          }
+        },
+    )
+
+    // 2. FULLSCREEN AR / ROBOT HUD OVERLAY (Boxen + 5 Meetpunten + Vloerzone)
+    Canvas(modifier = Modifier.fillMaxSize()) {
+      val scaleX = size.width / 640f
+      val scaleY = size.height / 480f
+      val textPaint = Paint().apply {
+        color = AndroidColor.WHITE
+        textSize = 38f
+        isAntiAlias = true
+        setShadowLayer(6f, 2f, 2f, AndroidColor.BLACK)
+      }
+
+      // Teken AI Object Boxen + Afstand in cm
+      for (item in detectedItems) {
+        val left = item.box.left * scaleX
+        val top = item.box.top * scaleY
+        val right = item.box.right * scaleX
+        val bottom = item.box.bottom * scaleY
+        val boxColor = if (item.distanceCm < 95) Color(0xFFFF3B30) else Color(0xFF00E5FF)
+
+        drawRect(
+            color = boxColor,
+            topLeft = Offset(left, top),
+            size = Size(right - left, bottom - top),
+            style = Stroke(width = 5f),
+        )
+        drawContext.canvas.nativeCanvas.drawText(
+            "${item.label} (${item.distanceCm}cm)",
+            left + 8f,
+            (top - 10f).coerceAtLeast(40f),
+            textPaint,
+        )
+      }
+
+      // Teken Vloer-Scan Zone onderin
+      val floorColor = if (navPoints.floorOk) Color(0x5500FF66) else Color(0x88FF2222)
+      drawRect(
+          color = floorColor,
+          topLeft = Offset(size.width * 0.30f, size.height * 0.82f),
+          size = Size(size.width * 0.40f, size.height * 0.14f),
+          style = Stroke(width = 4f),
+      )
+
+      // Helper om de 5 navigatie-vizieren te tekenen (Groen = Vrij, Rood = Geblokkeerd)
+      fun drawNavDot(xRatio: Float, yRatio: Float, isFree: Boolean, tag: String) {
+        val cx = size.width * xRatio
+        val cy = size.height * yRatio
+        val dotColor = if (isFree) Color(0xFF00FF66) else Color(0xFFFF2222)
+        drawCircle(color = dotColor, radius = 22f, center = Offset(cx, cy))
+        drawCircle(color = Color.White, radius = 26f, center = Offset(cx, cy), style = Stroke(3f))
+        drawContext.canvas.nativeCanvas.drawText(tag, cx - 12f, cy + 52f, textPaint)
+      }
+
+      drawNavDot(0.50f, 0.25f, navPoints.topMidFree, "T")
+      drawNavDot(0.50f, 0.52f, navPoints.midFree, "M")
+      drawNavDot(0.50f, 0.78f, navPoints.botMidFree, "B")
+      drawNavDot(0.20f, 0.55f, navPoints.leftFree, "L")
+      drawNavDot(0.80f, 0.55f, navPoints.rightFree, "R")
+    }
+
+    // 3. ZWEVENDE ROBOT STATUS BALK BOVENIN
+    Box(
+        modifier = Modifier
+            .align(Alignment.TopCenter)
+            .padding(top = 16.dp)
+            .background(Color(0xAA000000), RoundedCornerShape(12.dp))
+            .padding(horizontal = 20.dp, vertical = 10.dp)
+    ) {
+      Text(
+          text = aiStatus,
+          color = Color(0xFF00FF66),
+          fontSize = 20.sp,
+          fontWeight = FontWeight.Bold,
+      )
+    }
+
+    // 4. COMPACTE KNOPPEN ONDERIN (Zwevend over het fullscreen beeld)
+    Row(
+        modifier = Modifier
+            .align(Alignment.BottomCenter)
+            .fillMaxWidth()
+            .padding(bottom = 16.dp),
+        horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
+    ) {
+      Button(
+          onClick = onStartCamera,
+          colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC007AFF)),
+      ) {
+        Text("Start Vision")
+      }
+      Button(
+          onClick = onStopCamera,
+          colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC444444)),
+      ) {
+        Text("Stop")
+      }
+      Button(
+          onClick = onExit,
+          colors = ButtonDefaults.buttonColors(containerColor = Color(0xCCFF3B30)),
+      ) {
+        Text("Exit")
+      }
+    }
   }
 }
