@@ -16,6 +16,11 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: AI Model downloaden
+        run: |
+          mkdir -p app/src/main/assets
+          curl -L "https://googleapis.com" -o app/src/main/assets/model.tflite
+
       - name: Android licenties accepteren
         run: |
           mkdir -p "$ANDROID_HOME/licenses"
@@ -32,5 +37,5 @@ jobs:
       - name: APK klaarzetten om te downloaden
         uses: actions/upload-artifact@v4
         with:
-          name: Quest-Camera-App
+          name: Quest-Camera-AI-App
           path: "**/build/outputs/apk/debug/*.apk"
