@@ -1,6 +1,7 @@
 plugins {
-    alias(libs.plugins.android.application)
-    alias(libs.plugins.jetbrains.kotlin.android)
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("com.meta.spatial.plugin")
 }
 
 android {
@@ -45,7 +46,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Meta Spatial SDK & MRUK Room Understanding (voor echte 3D kamer- en vloerdata)
+    // Meta Spatial SDK & MRUK Room Understanding
     implementation("com.meta.spatial:meta-spatial-sdk:0.15.0")
     implementation("com.meta.spatial:meta-spatial-sdk-mruk:0.15.0")
 
