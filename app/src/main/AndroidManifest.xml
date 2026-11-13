@@ -5,19 +5,23 @@
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.CAMERA" />
     <uses-permission android:name="horizonos.permission.HEADSET_CAMERA" />
+    <!-- Required for Meta Quest Spatial Scene & Room Understanding -->
+    <uses-permission android:name="com.oculus.permission.USE_SCENE" />
 
     <uses-feature android:name="android.hardware.camera" />
-    <uses-feature android:name="android.hardware.camera2.full"
-        android:required="true"
-        />
-    <uses-feature
-        android:name="android.hardware.vr.headtracking"
-        android:required="true"
-        />
-    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" />
+    <uses-feature android:name="android.hardware.camera2.full" android:required="true" />
+    <uses-feature android:name="android.hardware.vr.headtracking" android:required="true" />
+    <uses-feature android:name="com.oculus.feature.PASSTHROUGH" android:required="true" />
+    <uses-feature android:name="oculus.software.scene" android:required="false" />
+
     <meta-data
         android:name="com.oculus.supportedDevices"
         android:value="quest3|quest3s" />
+    
+    <!-- Declare app as an immersive VR application -->
+    <meta-data
+        android:name="com.oculus.vr.focusaware"
+        android:value="true" />
 
     <application
         android:allowBackup="true"
@@ -29,14 +33,15 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.MyApplication"
         tools:targetApi="31">
+        
         <activity
             android:name=".MainActivity"
             android:exported="true"
             android:label="@string/app_name"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation"
             android:theme="@style/Theme.MyApplication">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
-
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
