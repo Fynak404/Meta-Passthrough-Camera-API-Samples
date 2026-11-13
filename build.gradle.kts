@@ -1,12 +1,11 @@
-// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-}
 plugins {
-    id("com.meta.spatial.plugin") version "x.y.z" // Meta Spatial SDK plugin
-    alias(libs.plugins.android.application) apply false
-    alias(libs.plugins.jetbrains.kotlin.android) apply false
+    id("com.android.application")
+    id("org.jetbrains.kotlin.android")
+    id("com.meta.spatial.plugin") // Required for Spatial SDK
 }
 
 dependencies {
-    implementation("com.meta.spatial:spatial-sdk:x.y.z")
-    implementation("com.meta.spatial:spatial-sdk-mruk:x.y.z") // Mixed Reality Utility Kit for Room Scanning
+    // Meta Spatial SDK Core & MRUK Room Understanding
+    implementation("com.meta.spatial:spatial-sdk:77.0.0")
+    implementation("com.meta.spatial:spatial-sdk-mruk:77.0.0")
 }
