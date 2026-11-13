@@ -6,23 +6,16 @@ plugins {
 
 allprojects {
     configurations.all {
+        // Blokkeer en vernietig de corrupte compiler-embeddable van Meta project-breed
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
+        
         resolutionStrategy {
             eachDependency {
                 if (requested.group == "org.jetbrains.kotlin") {
                     useVersion("2.1.0")
                 }
             }
-        }
-    }
-}
-
-// Intercepteer en uitschakelen van de metrics/statistieken service die de null-pointer veroorzaakt
-gradle.taskGraph.whenReady {
-    allTasks.forEach { task ->
-        if (task.javaClass.name.contains("BuildFlowService", ignoreCase = true) ||
-            task.javaClass.name.contains("Statistics", ignoreCase = true) ||
-            task.javaClass.name.contains("Metrics", ignoreCase = true)) {
-            task.enabled = false
         }
     }
 }
