@@ -15,11 +15,7 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    packaging {
-        resources.excludes.add("META-INF/*.kotlin_module")
-        resources.excludes.add("META-INF/versions/**/kotlin-stdlib*")
     }
-}
 
     buildTypes {
         release {
@@ -43,9 +39,13 @@ android {
             "-Xskip-prerelease-check"
         )
     }
+
+    packaging {
+        resources.excludes.add("META-INF/*.kotlin_module")
+        resources.excludes.add("META-INF/versions/**/kotlin-stdlib*")
+    }
 }
 
-// BELANGRIJK: dependencies moet BUITEN het android {} blok staan op topniveau!
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -56,7 +56,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Meta Spatial SDK & MRUK (met totale uitsluiting van ingebakken compiler en embeddable zooi)
+    // Meta Spatial SDK & MRUK
     implementation("com.meta.spatial:meta-spatial-sdk:0.15.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
@@ -69,3 +69,12 @@ dependencies {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     }
+
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.ui.test.junit4)
+    debugImplementation(libs.androidx.ui.tooling)
+    debugImplementation(libs.androidx.ui.test.manifest)
+}
