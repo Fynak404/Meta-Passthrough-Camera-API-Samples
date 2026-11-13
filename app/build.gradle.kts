@@ -1,46 +1,3 @@
-plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-}
-
-android {
-    namespace = "com.oculus.camerademo"
-    compileSdk = 34
-
-    defaultConfig {
-        applicationId = "com.oculus.camerademo"
-        minSdk = 29
-        targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
-
-        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-            proguardFiles(
-                getDefaultProguardFile("proguard-android-optimize.txt"),
-                "proguard-rules.pro"
-            )
-        }
-    }
-
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
-    }
-
-    kotlinOptions {
-    jvmTarget = "17"
-    freeCompilerArgs += listOf(
-        "-Xskip-metadata-version-check",
-        "-Xskip-prerelease-check"
-    )
-}
-}
-
 dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
@@ -51,9 +8,15 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Meta Spatial SDK & MRUK Room Understanding
-    implementation("com.meta.spatial:meta-spatial-sdk:0.15.0")
-    implementation("com.meta.spatial:meta-spatial-sdk-mruk:0.15.0")
+    // Meta Spatial SDK & MRUK Room Understanding (met exclusion op de corrupte compiler-embeddable)
+    implementation("com.meta.spatial:meta-spatial-sdk:0.15.0") {
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
+    }
+    implementation("com.meta.spatial:meta-spatial-sdk-mruk:0.15.0") {
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
+    }
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
