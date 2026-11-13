@@ -34,7 +34,6 @@ import android.view.Surface
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
-import java.nio.ByteBuffer
 import java.util.concurrent.Executors
 import kotlin.math.sqrt
 
@@ -115,7 +114,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
 
   fun init() {
     cameraConfigs.clear()
-    logv("Init")
+    logv("Init Stereo Cameras")
     cameraManager.cameraIdList.forEach { cameraId ->
       val cameraCharacteristics = cameraManager.getCameraCharacteristics(cameraId)
       val pixelSize = cameraCharacteristics.get(CameraCharacteristics.SENSOR_INFO_PIXEL_ARRAY_SIZE)
@@ -162,7 +161,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
         stereoFocalPx = rCfg.width * 0.44f
       }
     }
-    logConfigs(cameraConfigs)
   }
 
   fun getLatestStereoPair(): StereoFramePair? {
@@ -223,10 +221,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
     stopCamera()
   }
 
-  fun resetState() {
-    stopCamera()
-  }
-
   fun onHandleCameraEvent() {
     _eventLiveData.value = CameraEvent.Empty
   }
@@ -243,12 +237,8 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
             _permissionRequestState.value?.vendorCameraPermissionGranted ?: false,
         )
 
-    val androidPermissionStateChanged =
-        (androidPermissionGranted != _permissionRequestState.value?.nativeCameraPermissionGranted)
-    val vendorPermissionStateChanged =
-        (vendorPermissionGranted != permissionRequestState.value?.vendorCameraPermissionGranted)
-
-    if (androidPermissionStateChanged || vendorPermissionStateChanged) {
+    if (androidPermissionGranted != _permissionRequestState.value?.nativeCameraPermissionGranted ||
+        vendorPermissionGranted != _permissionRequestState.value?.vendorCameraPermissionGranted) {
       _permissionRequestState.value =
           _permissionRequestState.value?.copy(
               nativeCameraPermissionGranted = androidPermissionGranted,
@@ -288,27 +278,21 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
   }
 
   private fun openDualStereoCameras(previewSurface: Surface) {
-    val permissionRequestState = _permissionRequestState.value ?: return
-    if (!hasNecessaryPermissions(permissionRequestState)) {
-      postEvent("Missing required permissions")
-      return
-    }
+    val permissionState = _permissionRequestState.value ?: return
+    if (!permissionState.nativeCameraPermissionGranted || !permissionState.vendorCameraPermissionGranted) return
     if (cameraConfigs.isEmpty()) return
+
     val rCfg = cameraConfigs.find { it.position == Position.Right }
     val lCfg = cameraConfigs.find { it.position == Position.Left }
     if (rCfg == null) return
+
     rightConfig = rCfg
     leftConfig = lCfg
     stereoWidth = rCfg.width
     stereoHeight = rCfg.height
 
     rightImageReader =
-        ImageReader.newInstance(
-            rCfg.width,
-            rCfg.height,
-            ImageFormat.YUV_420_888,
-            IMAGE_BUFFER_SIZE,
-        ).apply {
+        ImageReader.newInstance(rCfg.width, rCfg.height, ImageFormat.YUV_420_888, IMAGE_BUFFER_SIZE).apply {
           onLatestImage(imageReaderHandler) { image ->
             val yBytes = extractYPlane(image, rCfg.width, rCfg.height)
             synchronized(stereoLock) { latestRightY = yBytes }
@@ -325,10 +309,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
               camera.createCaptureSession(
                   SessionConfiguration(
                       SessionConfiguration.SESSION_REGULAR,
-                      mutableListOf(
-                          OutputConfiguration(readerSurface),
-                          OutputConfiguration(previewSurface),
-                      ),
+                      mutableListOf(OutputConfiguration(readerSurface), OutputConfiguration(previewSurface)),
                       cameraSessionExecutor,
                       object : CameraCaptureSession.StateCallback() {
                         override fun onConfigured(session: CameraCaptureSession) {
@@ -338,7 +319,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
                             addTarget(previewSurface)
                           }
                           session.setRepeatingRequest(req.build(), null, cameraHandler)
-                          postEvent("Immersive 3D Stereo Active!")
                         }
                         override fun onConfigureFailed(session: CameraCaptureSession) {}
                       },
@@ -346,7 +326,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
               )
             } catch (_: Exception) {}
           }
-          override fun onDisconnected(camera: CameraDevice) { resetState() }
+          override fun onDisconnected(camera: CameraDevice) { stopCamera() }
           override fun onClosed(camera: CameraDevice) { super.onClosed(camera) }
           override fun onError(camera: CameraDevice, error: Int) {}
         },
@@ -355,12 +335,7 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
 
     if (lCfg != null && lCfg.width == rCfg.width && lCfg.height == rCfg.height) {
       leftImageReader =
-          ImageReader.newInstance(
-              lCfg.width,
-              lCfg.height,
-              ImageFormat.YUV_420_888,
-              IMAGE_BUFFER_SIZE,
-          ).apply {
+          ImageReader.newInstance(lCfg.width, lCfg.height, ImageFormat.YUV_420_888, IMAGE_BUFFER_SIZE).apply {
             onLatestImage(imageReaderHandler) { image ->
               val yBytes = extractYPlane(image, lCfg.width, lCfg.height)
               synchronized(stereoLock) { latestLeftY = yBytes }
@@ -401,19 +376,8 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
     }
   }
 
-  private fun hasNecessaryPermissions(state: PermissionRequestState) =
-      state.nativeCameraPermissionGranted && state.vendorCameraPermissionGranted
-
-  private fun arrayToString(arr: FloatArray?): String = arr?.joinToString(",") ?: "[]"
-
-  private fun logConfigs(configs: List<CameraConfig>) {
-    for (config in configs) {
-      logv("Camera ID: ${config.id} | Size: ${config.width}x${config.height} | Pos: ${config.position}")
-    }
-  }
-
-  private fun postEvent(message: String) {
-    mainHandler.post { _eventLiveData.value = CameraEvent.NotificationEvent(message) }
+  private fun postEvent(msg: String) {
+    mainHandler.post { _eventLiveData.value = CameraEvent.NotificationEvent(msg) }
   }
 }
 
