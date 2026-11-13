@@ -34,6 +34,10 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
+        freeCompilerArgs += listOf(
+            "-Xskip-metadata-version-check",
+            "-Xskip-prerelease-check"
+        )
     }
 
     packaging {
@@ -52,7 +56,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Meta Spatial SDK & MRUK met compiler-exclusions om versieconflicten te voorkomen
+    // Meta Spatial SDK & MRUK met volledige compiler-exclusions
     implementation("com.meta.spatial:meta-spatial-sdk:0.15.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
