@@ -52,21 +52,16 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Meta Spatial SDK & MRUK
+    // Meta Spatial SDK & MRUK (met totale uitsluiting van ingebakken compiler en embeddable zooi)
     implementation("com.meta.spatial:meta-spatial-sdk:0.15.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     }
     implementation("com.meta.spatial:meta-spatial-sdk-mruk:0.15.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib-jdk8")
+        exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     }
-
-    testImplementation(libs.junit)
-    androidTestImplementation(libs.androidx.junit)
-    androidTestImplementation(libs.androidx.espresso.core)
-    androidTestImplementation(platform(libs.androidx.compose.bom))
-    androidTestImplementation(libs.androidx.ui.test.junit4)
-    debugImplementation(libs.androidx.ui.tooling)
-    debugImplementation(libs.androidx.ui.test.manifest)
-}
