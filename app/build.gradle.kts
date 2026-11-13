@@ -33,8 +33,12 @@ android {
     }
 
     kotlinOptions {
-        jvmTarget = "17"
-    }
+    jvmTarget = "17"
+    freeCompilerArgs += listOf(
+        "-Xskip-metadata-version-check",
+        "-Xskip-prerelease-check"
+    )
+}
 }
 
 dependencies {
