@@ -15,4 +15,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "Meta-Passthrough-Camera-API-Samples"
-include(":app")  
+include(":app")
