@@ -14,7 +14,6 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-        // Schakel instrumented test runner uit om ontbrekende test-compilations te voorkomen
         testInstrumentationRunner = ""
     }
 
@@ -47,10 +46,11 @@ android {
     }
 }
 
-// Blokkeer en negeer ontbrekende AndroidTest compilations globaal
+// Schakel alle test-compilations globaal uit zodat de Meta Spatial plugin niet kan crashen op ontbrekende targets
 androidComponents {
     beforeVariants { variantBuilder ->
         variantBuilder.enableAndroidTest = false
+        variantBuilder.enableUnitTest = false
     }
 }
 
@@ -78,7 +78,6 @@ dependencies {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     }
 
-    testImplementation(libs.junit)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 }
