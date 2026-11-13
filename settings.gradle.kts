@@ -1,27 +1,18 @@
-// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
 pluginManagement {
-  repositories {
-    google {
-      content {
-        includeGroupByRegex("com\\.android.*")
-        includeGroupByRegex("com\\.google.*")
-        includeGroupByRegex("androidx.*")
-      }
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
     }
-    mavenCentral()
-    gradlePluginPortal()
-  }
 }
 
 dependencyResolutionManagement {
-  repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-  repositories {
-    google()
-    mavenCentral()
-  }
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
 }
 
-rootProject.name = "My Application"
-
-include(":app")
+rootProject.name = "Meta-Passthrough-Camera-API-Samples"
+include(":app")  
