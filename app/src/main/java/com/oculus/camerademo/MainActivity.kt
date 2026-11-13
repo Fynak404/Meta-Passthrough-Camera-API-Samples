@@ -59,12 +59,11 @@ import java.util.concurrent.Executors
 import kotlin.math.abs
 import kotlin.math.roundToInt
 
-data class DetectedItem(
-    val label: String,
-    val score: Float,
-    val box: RectF,
-    val distanceCm: Int = 0,
-    val heightZone: String = "TORSO",
+data class GroundCell(
+    val gridX: Int,
+    val gridZ: Int,
+    var isSafe: Boolean = true,
+    var depthCm: Int = 100,
 )
 
 class MainActivity : ComponentActivity() {
@@ -89,29 +88,19 @@ class MainActivity : ComponentActivity() {
   private var isCameraRunning = false
   private var lastImageWidth = 640
   private var lastImageHeight = 480
-  private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
-  private val aiStatusState = mutableStateOf("3D 1.80m Robot Vision Ready")
+  private val aiStatusState = mutableStateOf("3D Ground Scanner Initializing...")
 
-  // --- ESP32 & UDP SETTINGS ---
+  // --- UDP ESP32 & GROUND MAPPING GRID ---
   private var udpSocket: DatagramSocket? = null
   private val espIpAddress = "192.168.4.1"
   private val espPort = 4210
 
-  private val realObjectHeightsCm = mapOf(
-      "person" to 170f,
-      "chair" to 85f,
-      "couch" to 85f,
-      "dining table" to 75f,
-      "bed" to 65f,
-      "tv" to 60f,
-      "laptop" to 25f,
-      "cell phone" to 15f,
-      "bottle" to 22f,
-      "cup" to 12f,
-      "backpack" to 45f,
-      "book" to 24f,
-      "potted plant" to 40f
-  )
+  // 3D Ground Grid in front of the 1.80m robot (11 columns wide, 10 rows deep)
+  private val gridCols = 11
+  private val gridRows = 10
+  private val groundGrid = Array(gridCols) { c ->
+    Array(gridRows) { r -> GroundCell(c, r, true, 150) }
+  }
 
   private var lockedTurnDirection = "NONE"
 
@@ -119,8 +108,8 @@ class MainActivity : ComponentActivity() {
       object : Runnable {
         override fun run() {
           if (isCameraRunning) {
-            grabFrameAndDetect()
-            copyHandler.postDelayed(this, 100)
+            scanGroundAndEnvironment()
+            copyHandler.postDelayed(this, 100) // 10 FPS continuous scanning loop
           }
         }
       }
@@ -128,6 +117,7 @@ class MainActivity : ComponentActivity() {
   override fun onCreate(savedInstanceState: Bundle?) {
     super.onCreate(savedInstanceState)
 
+    // Fullscreen Immersive Mode
     WindowCompat.setDecorFitsSystemWindows(window, false)
     val controller = WindowInsetsControllerCompat(window, window.decorView)
     controller.hide(WindowInsetsCompat.Type.systemBars())
@@ -141,10 +131,10 @@ class MainActivity : ComponentActivity() {
     viewModel.uiState.observe(this) { uiState ->
       setContent {
         CameraDemoTheme {
-          Robot3DBlockUi(
+          GroundScannerUi(
               modifier = Modifier.fillMaxSize(),
               cameraState = uiState,
-              detectedItems = detectedItemsState.value,
+              grid = groundGrid,
               aiStatus = aiStatusState.value,
               onSurfaceReady = { surface -> previewSurface = surface },
               onSurfaceDestroyed = { previewSurface = null },
@@ -171,17 +161,17 @@ class MainActivity : ComponentActivity() {
           ObjectDetector.ObjectDetectorOptions.builder()
               .setBaseOptions(baseOptions)
               .setRunningMode(RunningMode.IMAGE)
-              .setMaxResults(8)
+              .setMaxResults(6)
               .setScoreThreshold(0.40f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "3D Bounding Block Engine Ready"
+      aiStatusState.value = "3D Ground Scanner Ready"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
   }
 
-  private fun grabFrameAndDetect() {
+  private fun scanGroundAndEnvironment() {
     val surface = previewSurface ?: return
     if (!surface.isValid || isDetecting || objectDetector == null) return
 
@@ -193,7 +183,7 @@ class MainActivity : ComponentActivity() {
           bitmap,
           { copyResult ->
             if (copyResult == PixelCopy.SUCCESS) {
-              runDetectionAndCommand(bitmap)
+              processTrue3DGroundScan(bitmap)
             } else {
               bitmap.recycle()
               isDetecting = false
@@ -207,55 +197,37 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun measureStereoDepthCm(stereo: StereoFramePair, xRatio: Float, yRatio: Float): Int? {
+  // True 3D Stereo Disparity Calculation specifically for the Floor/Ground in front of the robot
+  private fun computeGroundDisparityDepth(stereo: StereoFramePair, px: Int, py: Int): Int {
     val w = stereo.width
     val h = stereo.height
-    val rx = (w * xRatio).toInt()
-    val ry = (h * yRatio).toInt()
     val halfPatch = 6
-    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 20f).toInt().coerceIn(25, w / 3)
+    val maxDisp = 50
 
-    if (ry < halfPatch + 2 || ry >= h - halfPatch - 2) return null
-    if (rx < halfPatch + 2 || rx + maxDisp >= w - halfPatch - 2) return null
+    if (py < halfPatch || py >= h - halfPatch || px < halfPatch || px + maxDisp >= w - halfPatch) return 150
 
     var rSum = 0
     var count = 0
     for (dy in -halfPatch..halfPatch step 2) {
-      val row = (ry + dy) * w
+      val row = (py + dy) * w
       for (dx in -halfPatch..halfPatch step 2) {
-        rSum += (stereo.rightY[row + rx + dx].toInt() and 0xFF)
+        rSum += (stereo.rightY[row + px + dx].toInt() and 0xFF)
         count++
       }
     }
     val rMean = rSum / count
-    var rVar = 0
-    for (dy in -halfPatch..halfPatch step 2) {
-      val row = (ry + dy) * w
-      for (dx in -halfPatch..halfPatch step 2) {
-        rVar += abs((stereo.rightY[row + rx + dx].toInt() and 0xFF) - rMean)
-      }
-    }
-    if (rVar / count < 4) return null
-
     var bestDisp = -1
     var bestSad = Int.MAX_VALUE
-    for (d in 3..maxDisp) {
-      val lx = rx + d
-      var lSum = 0
-      for (dy in -halfPatch..halfPatch step 2) {
-        val row = (ry + dy) * w
-        for (dx in -halfPatch..halfPatch step 2) {
-          lSum += (stereo.leftY[row + lx + dx].toInt() and 0xFF)
-        }
-      }
-      val lMean = lSum / count
+
+    for (d in 2..maxDisp) {
+      val lx = px + d
       var sad = 0
       for (dy in -halfPatch..halfPatch step 2) {
-        val rRow = (ry + dy) * w
-        val lRow = (ry + dy) * w
+        val rRow = (py + dy) * w
+        val lRow = (py + dy) * w
         for (dx in -halfPatch..halfPatch step 2) {
-          val rVal = (stereo.rightY[rRow + rx + dx].toInt() and 0xFF) - rMean
-          val lVal = (stereo.leftY[lRow + lx + dx].toInt() and 0xFF) - lMean
+          val rVal = (stereo.rightY[rRow + px + dx].toInt() and 0xFF) - rMean
+          val lVal = (stereo.leftY[lRow + lx + dx].toInt() and 0xFF) - rMean
           sad += abs(rVal - lVal)
         }
       }
@@ -264,30 +236,9 @@ class MainActivity : ComponentActivity() {
         bestDisp = d
       }
     }
-    if (bestDisp <= 0) return null
-    return ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt().coerceIn(20, 250)
-  }
 
-  private fun isFloorFlat(bitmap: Bitmap): Boolean {
-    val w = bitmap.width
-    val h = bitmap.height
-    val startX = (w * 0.30f).toInt()
-    val endX = (w * 0.70f).toInt()
-    val startY = (h * 0.82f).toInt()
-    val endY = (h * 0.96f).toInt()
-    var grad = 0
-    var count = 0
-    for (y in startY until endY step 4) {
-      for (x in startX until endX step 4) {
-        val c1 = bitmap.getPixel(x, y)
-        val c2 = bitmap.getPixel(x + 4, y)
-        val l1 = (AndroidColor.red(c1) + AndroidColor.green(c1) + AndroidColor.blue(c1)) / 3
-        val l2 = (AndroidColor.red(c2) + AndroidColor.green(c2) + AndroidColor.blue(c2)) / 3
-        grad += abs(l1 - l2)
-        count++
-      }
-    }
-    return if (count == 0) true else (grad.toFloat() / count) < 18f
+    if (bestDisp <= 0) return 150
+    return ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt().coerceIn(15, 300)
   }
 
   private fun sendUdpToEsp32(payload: String) {
@@ -302,7 +253,7 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun runDetectionAndCommand(bitmap: Bitmap) {
+  private fun processTrue3DGroundScan(bitmap: Bitmap) {
     val detector = objectDetector ?: run {
       isDetecting = false
       return
@@ -313,58 +264,60 @@ class MainActivity : ComponentActivity() {
     aiExecutor.execute {
       try {
         val stereo = viewModel.getLatestStereoPair()
-        val mpImage = BitmapImageBuilder(bitmap).build()
-        val result = detector.detect(mpImage)
 
-        val items =
-            result.detections().mapNotNull { detection ->
-              val category = detection.categories().firstOrNull() ?: return@mapNotNull null
-              val name = category.categoryName()
-              val box = detection.boundingBox()
-              val cx = (box.centerX() / lastImageWidth).coerceIn(0.05f, 0.95f)
-              val cy = (box.centerY() / lastImageHeight).coerceIn(0.05f, 0.95f)
+        // 1. SCAN THE GROUND MESH (Lower 40% of the camera view where the floor is)
+        val w = lastImageWidth
+        val h = lastImageHeight
+        val groundStartY = (h * 0.60f).toInt()
 
-              val stereoDist = if (stereo != null) measureStereoDepthCm(stereo, cx, cy) else null
-              val fallbackDist = if (box.height() > 12f) {
-                (((realObjectHeightsCm[name] ?: 60f) * 540f) / box.height()).toInt().coerceIn(20, 250)
-              } else 250
+        for (c in 0 until gridCols) {
+          for (r in 0 until gridRows) {
+            val sampleX = (w * (0.15f + c * 0.07f)).toInt().coerceIn(0, w - 1)
+            val sampleY = (groundStartY + (r * ((h - groundStartY) / gridRows))).toInt().coerceIn(0, h - 1)
 
-              val zone = when {
-                cy < 0.35f -> "HOOFD (1.80m)"
-                cy < 0.70f -> "TORSO"
-                else -> "WIELEN/VLOER"
-              }
-              DetectedItem(name, category.score(), box, stereoDist ?: fallbackDist, zone)
-            }
+            val depth = if (stereo != null) {
+              computeGroundDisparityDepth(stereo, sampleX, sampleY)
+            } else 150
 
-        val floorOk = isFloorFlat(bitmap)
-        val closest = items.minByOrNull { it.distanceCm }
-        
-        // Beslissing voor de robot (binnen 65cm = remmen of draaien)
-        val blocked = (closest != null && closest.distanceCm < 65) || !floorOk
+            // Check if ground is flat or has an obstacle/drop-off
+            val c1 = bitmap.getPixel(sampleX, sampleY)
+            val luma = (AndroidColor.red(c1) + AndroidColor.green(c1) + AndroidColor.blue(c1)) / 3
+            val isSafe = depth > 50 && luma > 30
+
+            groundGrid[c][r].isSafe = isSafe
+            groundGrid[c][r].depthCm = depth
+          }
+        }
+
+        // 2. CHECK IMMEDIATE PATH IN FRONT OF WHEELS (Row 0 and 1 in grid)
+        var leftPathBlocked = false
+        var rightPathBlocked = false
+        var centerPathBlocked = false
+
+        for (r in 0..2) {
+          if (!groundGrid[3][r].isSafe || !groundGrid[4][r].isSafe) leftPathBlocked = true
+          if (!groundGrid[5][r].isSafe) centerPathBlocked = true
+          if (!groundGrid[6][r].isSafe || !groundGrid[7][r].isSafe) rightPathBlocked = true
+        }
+
         val command: String
-        if (!blocked) {
+        if (!centerPathBlocked) {
           lockedTurnDirection = "NONE"
           command = "FORWARD"
         } else {
           if (lockedTurnDirection == "NONE") {
-            // Kies op basis van positie of object of we links/rechts moeten uitwijken
-            lockedTurnDirection = if (closest != null && closest.box.centerX() < lastImageWidth / 2f) "TURN_RIGHT" else "TURN_LEFT"
+            lockedTurnDirection = if (!leftPathBlocked) "TURN_LEFT" else "TURN_RIGHT"
           }
           command = lockedTurnDirection
         }
 
-        val minCm = closest?.distanceCm ?: (if (!floorOk) 30 else 250)
-        val objLabel = closest?.label ?: (if (!floorOk) "uneven_floor" else "clear")
-
-        sendUdpToEsp32("CMD:$command|OBJ:$objLabel|CM:$minCm")
+        sendUdpToEsp32("CMD:$command|GROUND_SCAN:ACTIVE")
 
         runOnUiThread {
-          detectedItemsState.value = items
-          aiStatusState.value = "ROBOT [$command] | Dichtstbij: ${closest?.label ?: "Geen"} (${minCm}cm)"
+          aiStatusState.value = "3D GROUND MAPPING [CMD: $command] | Floor Status: ${if (centerPathBlocked) "BLOCKED" else "CLEAR"}"
         }
       } catch (e: Exception) {
-        runOnUiThread { aiStatusState.value = "Err: ${e.message}" }
+        runOnUiThread { aiStatusState.value = "Scan Error: ${e.message}" }
       } finally {
         bitmap.recycle()
         isDetecting = false
@@ -375,15 +328,11 @@ class MainActivity : ComponentActivity() {
   override fun onResume() {
     super.onResume()
     viewModel.permissionRequestState.observe(this) { permissionState ->
-      val permissionsToRequest = mutableListOf<String>()
-      if (!permissionState.nativeCameraPermissionGranted) {
-        permissionsToRequest.add(PermissionManager.ANDROID_CAMERA_PERMISSION)
-      }
-      if (!permissionState.vendorCameraPermissionGranted) {
-        permissionsToRequest.add(PermissionManager.HZOS_CAMERA_PERMISSION)
-      }
-      if (permissionsToRequest.isNotEmpty()) {
-        requestPermissionLauncher.launch(permissionsToRequest.toTypedArray())
+      val reqList = mutableListOf<String>()
+      if (!permissionState.nativeCameraPermissionGranted) reqList.add(PermissionManager.ANDROID_CAMERA_PERMISSION)
+      if (!permissionState.vendorCameraPermissionGranted) reqList.add(PermissionManager.HZOS_CAMERA_PERMISSION)
+      if (reqList.isNotEmpty()) {
+        requestPermissionLauncher.launch(reqList.toTypedArray())
       } else {
         viewModel.init()
       }
@@ -414,49 +363,31 @@ class MainActivity : ComponentActivity() {
   }
 
   private fun onStartCamera() {
-    checkPermissions()
-    val surface = previewSurface
-    if (surface == null) {
-      Toast.makeText(this, "Surface niet klaar", Toast.LENGTH_SHORT).show()
-      return
-    }
+    val surface = previewSurface ?: return
     viewModel.startCamera(surface)
     isCameraRunning = true
     copyHandler.removeCallbacks(frameGrabber)
-    copyHandler.postDelayed(frameGrabber, 300)
+    copyHandler.postDelayed(frameGrabber, 100)
   }
 
   private fun onStopCamera() {
     isCameraRunning = false
     copyHandler.removeCallbacks(frameGrabber)
     viewModel.stopCamera()
-    detectedItemsState.value = emptyList()
-    aiStatusState.value = "Gestopt"
+    aiStatusState.value = "Scanner Stopped"
   }
 
   private fun onExit() {
     onStopCamera()
     finish()
   }
-
-  private fun checkPermissions() {
-    if (
-        !permissionManager.checkPermissions(
-            this,
-            android.Manifest.permission.CAMERA,
-            PermissionManager.HZOS_CAMERA_PERMISSION,
-        )
-    ) {
-      Toast.makeText(this, "Mist camerabevoegdheden", Toast.LENGTH_SHORT).show()
-    }
-  }
 }
 
 @Composable
-fun Robot3DBlockUi(
+fun GroundScannerUi(
     modifier: Modifier = Modifier,
     cameraState: Any,
-    detectedItems: List<DetectedItem>,
+    grid: Array<Array<GroundCell>>,
     aiStatus: String,
     onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
@@ -467,8 +398,8 @@ fun Robot3DBlockUi(
   Box(modifier = modifier.fillMaxSize().background(Color.Black)) {
     AndroidView(
         modifier = Modifier.fillMaxSize(),
-        factory = { context ->
-          TextureView(context).apply {
+        factory = { ctx ->
+          TextureView(ctx).apply {
             surfaceTextureListener =
                 object : SurfaceTextureListener {
                   override fun onSurfaceTextureAvailable(surface: SurfaceTexture, w: Int, h: Int) {
@@ -485,49 +416,29 @@ fun Robot3DBlockUi(
         },
     )
 
-    // ECHTE 3D BLOKKEN CANVAS OVERLAY (Tekent strakke 3D omhullende blokken om objecten)
+    // TRUE 3D GROUND MESH GRID OVERLAY ON THE FLOOR
     Canvas(modifier = Modifier.fillMaxSize()) {
-      val scaleX = size.width / 640f
-      val scaleY = size.height / 480f
-      val textPaint = Paint().apply {
-        color = AndroidColor.WHITE
-        textSize = 34f
-        isAntiAlias = true
-        setShadowLayer(6f, 2f, 2f, AndroidColor.BLACK)
-      }
+      val startX = size.width * 0.2f
+      val startY = size.height * 0.60f
+      val cellWidth = (size.width * 0.6f) / 11f
+      val cellHeight = (size.height * 0.38f) / 10f
 
-      for (item in detectedItems) {
-        val left = item.box.left * scaleX
-        val top = item.box.top * scaleY
-        val right = item.box.right * scaleX
-        val bottom = item.box.bottom * scaleY
+      for (c in 0 until 11) {
+        for (r in 0 until 10) {
+          val cell = grid[c][r]
+          val color = if (cell.isSafe) Color(0x6600FF66) else Color(0xAAFF3B30)
 
-        val boxColor = if (item.distanceCm < 65) Color(0xFFFF3B30) else Color(0xFF00E5FF)
-
-        // Hoofdblok
-        drawRect(
-            color = boxColor,
-            topLeft = Offset(left, top),
-            size = Size(right - left, bottom - top),
-            style = Stroke(width = 6f),
-        )
-
-        // 3D Diepte-lijntjes zodat het een solide blok vormt
-        val depthOffset = 18f
-        drawLine(color = boxColor.copy(alpha = 0.7f), start = Offset(right, top), end = Offset(right + depthOffset, top - depthOffset), strokeWidth = 3f)
-        drawLine(color = boxColor.copy(alpha = 0.7f), start = Offset(right, bottom), end = Offset(right + depthOffset, bottom - depthOffset), strokeWidth = 3f)
-        drawLine(color = boxColor.copy(alpha = 0.7f), start = Offset(right + depthOffset, top - depthOffset), end = Offset(right + depthOffset, bottom - depthOffset), strokeWidth = 3f)
-
-        drawContext.canvas.nativeCanvas.drawText(
-            "${item.label.uppercase()} [${item.distanceCm}cm] (${item.heightZone})",
-            left + 8f,
-            (top - 12f).coerceAtLeast(40f),
-            textPaint,
-        )
+          drawRect(
+              color = color,
+              topLeft = Offset(startX + (c * cellWidth), startY + (r * cellHeight)),
+              size = Size(cellWidth - 3f, cellHeight - 3f),
+              style = Stroke(width = 2f)
+          )
+        }
       }
     }
 
-    // Status Balk Bovenin
+    // Top Status Bar
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
@@ -543,7 +454,7 @@ fun Robot3DBlockUi(
       )
     }
 
-    // Besturingsknoppen Onderin
+    // Bottom Controls
     Row(
         modifier = Modifier
             .align(Alignment.BottomCenter)
@@ -551,22 +462,13 @@ fun Robot3DBlockUi(
             .padding(bottom = 24.dp),
         horizontalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterHorizontally),
     ) {
-      Button(
-          onClick = onStartCamera,
-          colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC007AFF)),
-      ) {
-        Text("Start 3D Vision")
+      Button(onClick = onStartCamera, colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC007AFF))) {
+        Text("Start Ground Scanner")
       }
-      Button(
-          onClick = onStopCamera,
-          colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC444444)),
-      ) {
+      Button(onClick = onStopCamera, colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC444444))) {
         Text("Stop")
       }
-      Button(
-          onClick = onExit,
-          colors = ButtonDefaults.buttonColors(containerColor = Color(0xCCFF3B30)),
-      ) {
+      Button(onClick = onExit, colors = ButtonDefaults.buttonColors(containerColor = Color(0xCCFF3B30))) {
         Text("Exit")
       }
     }
