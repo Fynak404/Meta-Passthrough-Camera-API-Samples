@@ -36,7 +36,6 @@ import androidx.lifecycle.LiveData
 import androidx.lifecycle.MutableLiveData
 import java.nio.ByteBuffer
 import java.util.concurrent.Executors
-import kotlin.math.abs
 import kotlin.math.sqrt
 
 data class StereoFramePair(
@@ -287,8 +286,6 @@ class XrCameraDemoViewModel(application: Application) : AndroidViewModel(applica
     }
     return out
   }
-
-  private fun getBrightness(buffer: ByteBuffer, width: Int, height: Int): Int = 128
 
   private fun openDualStereoCameras(previewSurface: Surface) {
     val permissionRequestState = _permissionRequestState.value ?: return
