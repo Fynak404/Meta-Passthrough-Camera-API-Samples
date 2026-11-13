@@ -15,7 +15,11 @@ android {
         versionCode = 1
         versionName = "1.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    packaging {
+        resources.excludes.add("META-INF/*.kotlin_module")
+        resources.excludes.add("META-INF/versions/**/kotlin-stdlib*")
     }
+}
 
     buildTypes {
         release {
