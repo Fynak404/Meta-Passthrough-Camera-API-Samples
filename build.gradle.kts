@@ -11,23 +11,3 @@ allprojects {
         mavenCentral()
     }
 }
-
-// Zorg ervoor dat subprojecten/modules correct worden opgebouwd
-subprojects {
-    afterEvaluate { project ->
-        if (project.hasProperty("android")) {
-            project.extensions.configure("android") { ext ->
-                val androidExt = ext as com.android.build.gradle.BaseExtension
-                if (project.name == "app") {
-                    androidExt.sourceSets {
-                        getByName("main") {
-                            manifest.srcFile("src/main/AndroidManifest.xml")
-                            java.srcDirs("src/main/java")
-                            res.srcDirs("src/main/res")
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
