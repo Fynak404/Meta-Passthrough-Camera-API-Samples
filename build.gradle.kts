@@ -48,9 +48,9 @@ dependencies {
     // MediaPipe Object Detection
     implementation("com.google.mediapipe:tasks-vision:0.10.14")
 
-    // Meta Spatial SDK & MRUK Room Understanding
-    implementation("com.meta.spatial:spatial-sdk:77.0.0")
-    implementation("com.meta.spatial:spatial-sdk-mruk:77.0.0")
+    // Correct Meta Spatial SDK & MRUK packages & version
+    implementation("com.meta.spatial:meta-spatial-sdk:0.15.0")
+    implementation("com.meta.spatial:meta-spatial-sdk-mruk:0.15.0")
 
     testImplementation(libs.junit)
     androidTestImplementation(libs.androidx.junit)
