@@ -1,5 +1,3 @@
-// (c) Meta Platforms, Inc. and affiliates. Confidential and proprietary.
-
 package com.oculus.camerademo
 
 import android.os.Bundle
@@ -36,23 +34,22 @@ class MainActivity : SpatialActivity() {
     super.onSceneReady()
     Log.i(TAG, "Spatial Scene Ready. Initializing MRUK Room Understanding...")
 
-    // Initialize Meta's Room Understanding (MRUK) to map the physical room
+    // Vraag direct de echte 3D kamer- en vloerdata op via Meta's OS
     MRUK.initialize(this) { success ->
       if (success) {
         val currentRoom: Room? = MRUK.getInstance().getCurrentRoom()
         if (currentRoom != null) {
           Log.i(TAG, "Room successfully loaded from Quest 3 hardware scan!")
           
-          // Get the actual floor boundary and spatial layout of your room
           val floorAnchor = currentRoom.floorAnchor
           val boundingBox = currentRoom.getBoundingBox()
 
           Log.i(TAG, "Floor anchor detected: center=${floorAnchor?.center}, size=${boundingBox}")
 
-          // Transmit true spatial boundary data to your robot's ESP32 controller
+          // Stuur signaal naar ESP32 dat de 3D-omgeving geladen is
           sendBoundaryToEsp32("BOUNDARY_LOADED:VALID")
         } else {
-          Log.w(TAG, "No room mesh found. Please run Quest room setup in headset settings.")
+          Log.w(TAG, "No room mesh found. Run Quest room setup in headset settings.")
           sendBoundaryToEsp32("CMD:STOP|ERROR:NO_ROOM_SETUP")
         }
       } else {
