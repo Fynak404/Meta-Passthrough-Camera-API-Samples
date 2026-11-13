@@ -67,14 +67,6 @@ data class DetectedItem(
     val heightZone: String = "TORSO",
 )
 
-// 3D VOXEL CEL (X = Links/Rechts, Y = Hoogte 0..200cm, Z = Diepte vooruit)
-data class Voxel3D(
-    val x: Int,
-    val y: Int,
-    val z: Int,
-    var density: Float = 0f, // 0.0 = Lege lucht, 1.0 = Massief 3D obstakel
-)
-
 class MainActivity : ComponentActivity() {
   private val viewModel by lazy {
     ViewModelProvider.AndroidViewModelFactory(application).create(XrCameraDemoViewModel::class.java)
@@ -98,22 +90,12 @@ class MainActivity : ComponentActivity() {
   private var lastImageWidth = 640
   private var lastImageHeight = 480
   private val detectedItemsState = mutableStateOf<List<DetectedItem>>(emptyList())
-  private val aiStatusState = mutableStateOf("3D Voxel Engine Ready")
+  private val aiStatusState = mutableStateOf("3D 1.80m Robot Vision Ready")
 
-  // --- ESP32 & 3D VOXEL MAP SETTINGS ---
+  // --- ESP32 & UDP SETTINGS ---
   private var udpSocket: DatagramSocket? = null
   private val espIpAddress = "192.168.4.1"
   private val espPort = 4210
-
-  // 3D Voxel Ruimte: 15 breed (X) x 10 hoog (Y: 0cm tot 200cm) x 15 diep (Z: 0cm tot 150cm)
-  private val sizeX = 15
-  private val sizeY = 10 // Elke laag = 20 cm hoogte (Laag 0 = Vloer/Wielen, Laag 8-9 = Quest 3 Hoofd op 180cm)
-  private val sizeZ = 15
-  private val voxelSpace = Array(sizeX) { x ->
-    Array(sizeY) { y ->
-      Array(sizeZ) { z -> Voxel3D(x, y, z, 0f) }
-    }
-  }
 
   private val realObjectHeightsCm = mapOf(
       "person" to 170f,
@@ -159,11 +141,10 @@ class MainActivity : ComponentActivity() {
     viewModel.uiState.observe(this) { uiState ->
       setContent {
         CameraDemoTheme {
-          Voxel3DRobotUi(
+          Robot3DBlockUi(
               modifier = Modifier.fillMaxSize(),
               cameraState = uiState,
               detectedItems = detectedItemsState.value,
-              voxels = voxelSpace,
               aiStatus = aiStatusState.value,
               onSurfaceReady = { surface -> previewSurface = surface },
               onSurfaceDestroyed = { previewSurface = null },
@@ -194,7 +175,7 @@ class MainActivity : ComponentActivity() {
               .setScoreThreshold(0.40f)
               .build()
       objectDetector = ObjectDetector.createFromOptions(this, options)
-      aiStatusState.value = "3D Voxel Spatial Mapper Ready"
+      aiStatusState.value = "3D Bounding Block Engine Ready"
     } catch (e: Exception) {
       aiStatusState.value = "AI Error: ${e.message}"
     }
@@ -212,7 +193,7 @@ class MainActivity : ComponentActivity() {
           bitmap,
           { copyResult ->
             if (copyResult == PixelCopy.SUCCESS) {
-              run3DSpatialMapping(bitmap)
+              runDetectionAndCommand(bitmap)
             } else {
               bitmap.recycle()
               isDetecting = false
@@ -226,14 +207,13 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  // Meet 3D diepte op een specifiek punt via stereo-dispariteit (Linker + Rechter Quest 3 lens)
   private fun measureStereoDepthCm(stereo: StereoFramePair, xRatio: Float, yRatio: Float): Int? {
     val w = stereo.width
     val h = stereo.height
     val rx = (w * xRatio).toInt()
     val ry = (h * yRatio).toInt()
     val halfPatch = 6
-    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 25f).toInt().coerceIn(25, w / 3)
+    val maxDisp = ((stereo.baselineCm * stereo.focalLengthPx) / 20f).toInt().coerceIn(25, w / 3)
 
     if (ry < halfPatch + 2 || ry >= h - halfPatch - 2) return null
     if (rx < halfPatch + 2 || rx + maxDisp >= w - halfPatch - 2) return null
@@ -288,7 +268,6 @@ class MainActivity : ComponentActivity() {
     return ((stereo.baselineCm * stereo.focalLengthPx) / bestDisp.toFloat()).roundToInt().coerceIn(20, 250)
   }
 
-  // Controleer vlakheid van de grond op laag Y=0
   private fun isFloorFlat(bitmap: Bitmap): Boolean {
     val w = bitmap.width
     val h = bitmap.height
@@ -308,64 +287,7 @@ class MainActivity : ComponentActivity() {
         count++
       }
     }
-    return if (count == 0) true else (grad.toFloat() / count) < 17f
-  }
-
-  // Vul het 3D Voxel Raster met de gemeten dieptepunten + AI objecten
-  private fun update3DVoxelMap(
-      stereo: StereoFramePair?,
-      items: List<DetectedItem>,
-      floorOk: Boolean
-  ) {
-    // 1. Temporal Decay: vervaag oude voxels langzaam zodat de kaart live meebeweegt
-    for (x in 0 until sizeX) {
-      for (y in 0 until sizeY) {
-        for (z in 0 until sizeZ) {
-          voxelSpace[x][y][z].density = (voxelSpace[x][y][z].density * 0.80f).coerceAtLeast(0f)
-        }
-      }
-    }
-
-    // 2. Vloerlaag (Y=0) checken direct voor de wielen (Z=1..3)
-    if (!floorOk) {
-      for (x in 6..8) {
-        for (z in 1..3) {
-          voxelSpace[x][0][z].density = 1.0f
-        }
-      }
-    }
-
-    // 3. Stereo 3D Raster-scan over het gehele gezichtsveld (9x7 punten in 3D ruimte)
-    if (stereo != null) {
-      for (gx in 0 until 9) {
-        val xRatio = 0.15f + (gx * 0.0875f) // 0.15 tot 0.85
-        for (gy in 0 until 7) {
-          val yRatio = 0.15f + (gy * 0.10f) // 0.15 (Hoog/Hoofd) tot 0.75 (Laag/Vloer)
-          val distCm = measureStereoDepthCm(stereo, xRatio, yRatio) ?: continue
-
-          if (distCm < 140) {
-            val vx = ((xRatio * (sizeX - 1))).roundToInt().coerceIn(0, sizeX - 1)
-            // Y-inversie: bovenin beeld (yRatio laag) = hoog in 3D (Y=8..9, hoofdhoogte 180cm)
-            val vy = (((1f - yRatio) * (sizeY - 1))).roundToInt().coerceIn(0, sizeY - 1)
-            val vz = (distCm / 10).coerceIn(1, sizeZ - 1)
-
-            voxelSpace[vx][vy][vz].density = 1.0f
-          }
-        }
-      }
-    }
-
-    // 4. AI Objecten als 3D-volumes in het voxel-raster plaatsen
-    for (item in items) {
-      val vx = ((item.box.centerX() / lastImageWidth) * (sizeX - 1)).roundToInt().coerceIn(0, sizeX - 1)
-      val vz = (item.distanceCm / 10).coerceIn(1, sizeZ - 1)
-      val topY = (((1f - (item.box.top / lastImageHeight)) * (sizeY - 1))).roundToInt().coerceIn(0, sizeY - 1)
-      val botY = (((1f - (item.box.bottom / lastImageHeight)) * (sizeY - 1))).roundToInt().coerceIn(0, sizeY - 1)
-
-      for (y in minOf(topY, botY)..maxOf(topY, botY)) {
-        voxelSpace[vx][y][vz].density = 1.0f
-      }
-    }
+    return if (count == 0) true else (grad.toFloat() / count) < 18f
   }
 
   private fun sendUdpToEsp32(payload: String) {
@@ -380,7 +302,7 @@ class MainActivity : ComponentActivity() {
     }
   }
 
-  private fun run3DSpatialMapping(bitmap: Bitmap) {
+  private fun runDetectionAndCommand(bitmap: Bitmap) {
     val detector = objectDetector ?: run {
       isDetecting = false
       return
@@ -408,7 +330,7 @@ class MainActivity : ComponentActivity() {
               } else 250
 
               val zone = when {
-                cy < 0.35f -> "HOOFD (180cm)"
+                cy < 0.35f -> "HOOFD (1.80m)"
                 cy < 0.70f -> "TORSO"
                 else -> "WIELEN/VLOER"
               }
@@ -416,60 +338,33 @@ class MainActivity : ComponentActivity() {
             }
 
         val floorOk = isFloorFlat(bitmap)
-        update3DVoxelMap(stereo, items, floorOk)
-
-        // 3D KOLLISIE CHECK OVER DE HELE HOOGTE VAN DE 1.80M ROBOT (Y = 0 tot Y = 9)
-        var centerBlocked = !floorOk
-        var leftBlocked = false
-        var rightBlocked = false
-        var blockedHeightZone = "VRIJ"
-
-        for (y in 0 until sizeY) {
-          for (z in 1..6) { // Kijk tot 60 cm vooruit in 3D
-            // Middenkolom (X = 6, 7, 8)
-            if (voxelSpace[6][y][z].density > 0.6f || voxelSpace[7][y][z].density > 0.6f || voxelSpace[8][y][z].density > 0.6f) {
-              centerBlocked = true
-              blockedHeightZone = if (y >= 7) "HOOFD-HOOGTE" else if (y >= 3) "TORSO-HOOGTE" else "VLOER/WIELEN"
-            }
-            // Linkerkolom (X = 2, 3, 4)
-            if (voxelSpace[2][y][z].density > 0.6f || voxelSpace[3][y][z].density > 0.6f) {
-              leftBlocked = true
-            }
-            // Rechterkolom (X = 10, 11, 12)
-            if (voxelSpace[10][y][z].density > 0.6f || voxelSpace[11][y][z].density > 0.6f) {
-              rightBlocked = true
-            }
-          }
-        }
-
+        val closest = items.minByOrNull { it.distanceCm }
+        
+        // Beslissing voor de robot (binnen 65cm = remmen of draaien)
+        val blocked = (closest != null && closest.distanceCm < 65) || !floorOk
         val command: String
-        if (!centerBlocked) {
+        if (!blocked) {
           lockedTurnDirection = "NONE"
           command = "FORWARD"
         } else {
           if (lockedTurnDirection == "NONE") {
-            lockedTurnDirection = when {
-              !leftBlocked && rightBlocked -> "TURN_LEFT"
-              !rightBlocked && leftBlocked -> "TURN_RIGHT"
-              !leftBlocked && !rightBlocked -> "TURN_LEFT"
-              else -> "SPIN_SEARCH"
-            }
+            // Kies op basis van positie of object of we links/rechts moeten uitwijken
+            lockedTurnDirection = if (closest != null && closest.box.centerX() < lastImageWidth / 2f) "TURN_RIGHT" else "TURN_LEFT"
           }
           command = lockedTurnDirection
         }
 
-        val closest = items.minByOrNull { it.distanceCm }
         val minCm = closest?.distanceCm ?: (if (!floorOk) 30 else 250)
-        val objLabel = closest?.label ?: (if (!floorOk) "uneven_floor" else "clear_3d")
+        val objLabel = closest?.label ?: (if (!floorOk) "uneven_floor" else "clear")
 
-        sendUdpToEsp32("CMD:$command|OBJ:$objLabel|CM:$minCm|ZONE:$blockedHeightZone")
+        sendUdpToEsp32("CMD:$command|OBJ:$objLabel|CM:$minCm")
 
         runOnUiThread {
           detectedItemsState.value = items
-          aiStatusState.value = "3D VOXEL [$command] | Hoogte: $blockedHeightZone | Grond: ${if (floorOk) "VLAK" else "ONVLAK"}"
+          aiStatusState.value = "ROBOT [$command] | Dichtstbij: ${closest?.label ?: "Geen"} (${minCm}cm)"
         }
       } catch (e: Exception) {
-        runOnUiThread { aiStatusState.value = "3D Map err: ${e.message}" }
+        runOnUiThread { aiStatusState.value = "Err: ${e.message}" }
       } finally {
         bitmap.recycle()
         isDetecting = false
@@ -536,7 +431,7 @@ class MainActivity : ComponentActivity() {
     copyHandler.removeCallbacks(frameGrabber)
     viewModel.stopCamera()
     detectedItemsState.value = emptyList()
-    aiStatusState.value = "3D Mapping Gestopt"
+    aiStatusState.value = "Gestopt"
   }
 
   private fun onExit() {
@@ -558,11 +453,10 @@ class MainActivity : ComponentActivity() {
 }
 
 @Composable
-fun Voxel3DRobotUi(
+fun Robot3DBlockUi(
     modifier: Modifier = Modifier,
     cameraState: Any,
     detectedItems: List<DetectedItem>,
-    voxels: Array<Array<Array<Voxel3D>>>,
     aiStatus: String,
     onSurfaceReady: (Surface) -> Unit,
     onSurfaceDestroyed: () -> Unit,
@@ -591,66 +485,49 @@ fun Voxel3DRobotUi(
         },
     )
 
-    // 3D VOXEL PROJECTION & HUD OVERLAY
+    // ECHTE 3D BLOKKEN CANVAS OVERLAY (Tekent strakke 3D omhullende blokken om objecten)
     Canvas(modifier = Modifier.fillMaxSize()) {
       val scaleX = size.width / 640f
       val scaleY = size.height / 480f
       val textPaint = Paint().apply {
         color = AndroidColor.WHITE
-        textSize = 32f
+        textSize = 34f
         isAntiAlias = true
         setShadowLayer(6f, 2f, 2f, AndroidColor.BLACK)
       }
 
-      // Teken 3D AI Object Boxen + Hoogtezone
       for (item in detectedItems) {
         val left = item.box.left * scaleX
         val top = item.box.top * scaleY
         val right = item.box.right * scaleX
         val bottom = item.box.bottom * scaleY
+
+        val boxColor = if (item.distanceCm < 65) Color(0xFFFF3B30) else Color(0xFF00E5FF)
+
+        // Hoofdblok
         drawRect(
-            color = if (item.distanceCm < 70) Color(0xFFFF3B30) else Color(0xFF00E5FF),
+            color = boxColor,
             topLeft = Offset(left, top),
             size = Size(right - left, bottom - top),
-            style = Stroke(width = 4f),
+            style = Stroke(width = 6f),
         )
+
+        // 3D Diepte-lijntjes zodat het een solide blok vormt
+        val depthOffset = 18f
+        drawLine(color = boxColor.copy(alpha = 0.7f), start = Offset(right, top), end = Offset(right + depthOffset, top - depthOffset), strokeWidth = 3f)
+        drawLine(color = boxColor.copy(alpha = 0.7f), start = Offset(right, bottom), end = Offset(right + depthOffset, bottom - depthOffset), strokeWidth = 3f)
+        drawLine(color = boxColor.copy(alpha = 0.7f), start = Offset(right + depthOffset, top - depthOffset), end = Offset(right + depthOffset, bottom - depthOffset), strokeWidth = 3f)
+
         drawContext.canvas.nativeCanvas.drawText(
-            "${item.label} | ${item.distanceCm}cm [${item.heightZone}]",
-            left + 6f,
-            (top - 8f).coerceAtLeast(35f),
+            "${item.label.uppercase()} [${item.distanceCm}cm] (${item.heightZone})",
+            left + 8f,
+            (top - 12f).coerceAtLeast(40f),
             textPaint,
         )
       }
-
-      // Teken 3D Voxel Radar (Top-Down + Hoogte-indicatie) rechtsboven
-      val radarX = size.width - 200f
-      val radarY = 110f
-      val cell = 11f
-      for (x in 0 until 15) {
-        for (z in 0 until 15) {
-          var maxYBlocked = -1
-          for (y in 0 until 10) {
-            if (voxels[x][y][z].density > 0.6f) {
-              maxYBlocked = y
-            }
-          }
-          val color = when {
-            x == 7 && z == 0 -> Color.Blue // Robot (1.80m)
-            maxYBlocked >= 7 -> Color.Magenta // Hoofdhoogte obstakel (140-180cm)
-            maxYBlocked >= 3 -> Color.Red // Torso obstakel (60-140cm)
-            maxYBlocked >= 0 -> Color.Yellow // Laag obstakel / Vloer (0-60cm)
-            else -> Color.Green.copy(alpha = 0.25f)
-          }
-          drawRect(
-              color = color,
-              topLeft = Offset(radarX + (x * cell), radarY + ((14 - z) * cell)),
-              size = Size(cell - 1f, cell - 1f),
-          )
-        }
-      }
     }
 
-    // Top Status Banner
+    // Status Balk Bovenin
     Box(
         modifier = Modifier
             .align(Alignment.TopCenter)
@@ -666,7 +543,7 @@ fun Voxel3DRobotUi(
       )
     }
 
-    // Bottom Controls
+    // Besturingsknoppen Onderin
     Row(
         modifier = Modifier
             .align(Alignment.BottomCenter)
@@ -678,7 +555,7 @@ fun Voxel3DRobotUi(
           onClick = onStartCamera,
           colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC007AFF)),
       ) {
-        Text("Start 3D Map")
+        Text("Start 3D Vision")
       }
       Button(
           onClick = onStopCamera,
