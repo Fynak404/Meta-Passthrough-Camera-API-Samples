@@ -14,7 +14,7 @@ android {
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
-        testInstrumentationRunner = ""
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     buildTypes {
@@ -34,23 +34,11 @@ android {
 
     kotlinOptions {
         jvmTarget = "17"
-        freeCompilerArgs += listOf(
-            "-Xskip-metadata-version-check",
-            "-Xskip-prerelease-check"
-        )
     }
 
     packaging {
         resources.excludes.add("META-INF/*.kotlin_module")
         resources.excludes.add("META-INF/versions/**/kotlin-stdlib*")
-    }
-}
-
-// Schakel alle test-compilations globaal uit zodat de Meta Spatial plugin niet kan crashen op ontbrekende targets
-androidComponents {
-    beforeVariants { variantBuilder ->
-        variantBuilder.enableAndroidTest = false
-        variantBuilder.enableUnitTest = false
     }
 }
 
@@ -64,7 +52,7 @@ dependencies {
     implementation(libs.androidx.ui.tooling.preview)
     implementation(libs.androidx.material3)
 
-    // Meta Spatial SDK & MRUK
+    // Meta Spatial SDK & MRUK met compiler-exclusions
     implementation("com.meta.spatial:meta-spatial-sdk:0.15.0") {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler-embeddable")
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-compiler")
@@ -78,6 +66,11 @@ dependencies {
         exclude(group = "org.jetbrains.kotlin", module = "kotlin-stdlib")
     }
 
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation(libs.androidx.ui.test.junit4)
     debugImplementation(libs.androidx.ui.tooling)
     debugImplementation(libs.androidx.ui.test.manifest)
 }
